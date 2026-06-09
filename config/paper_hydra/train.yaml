@@ -1,0 +1,37 @@
+# Simple Hydra config for paper-style OmniXAS training on tutorial_omnixas/ml_data
+seed: 42
+
+experiment:
+  # one of: expertXAS, universalXAS, tunedUniversalXAS
+  name: expertXAS
+  element: Ti
+  type: FEFF
+
+data:
+  data_dir: tutorial_omnixas/ml_data
+  universal_elements: [Ti, V, Cr, Mn, Fe, Co, Ni, Cu]
+
+model:
+  input_dim: 64
+  output_dim: 141
+  # defaults to Ti FEFF expert; override for other paper models
+  hidden_dims: [600, 600, 450]
+  dropout: 0.5
+
+training:
+  batch_size: 32
+  max_epochs: 1000
+  patience: 25
+  lr: 0.0001
+  accelerator: auto
+  devices: 1
+  num_workers: 0
+  check_val_every_n_epoch: 2
+
+checkpoint:
+  # set this for tunedUniversalXAS, e.g. output/.../.hydra sibling checkpoint path
+  init_from: null
+
+hydra:
+  run:
+    dir: output/hydra_training/${experiment.name}/${experiment.element}_${experiment.type}/${now:%Y-%m-%d_%H-%M-%S}
