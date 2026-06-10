@@ -19,6 +19,7 @@ if args.n_runs < 1:
 
 import numpy as np
 import torch
+from torch.utils.data import DataLoader, TensorDataset
 from lightning.pytorch import seed_everything
 from omnixas.data.ml_data import MLData, MLSplits
 from omnixas.model.xasblock import XASBlock
@@ -52,14 +53,6 @@ def vloss(path):
     return float(m.group(1)) if m else float("inf")
 
 
-def best(runs, label):
-    ckpts = sorted(Path(runs).glob("paper_*/best*.ckpt"))
-    if not ckpts:
-        raise FileNotFoundError(f"No paper_* checkpoint for {label}. Train UniversalXAS first if fine-tuning.")
-    ckpt = min(ckpts, key=vloss)
-    print(f"Best {label}: {ckpt}", flush=True)
-    return ckpt
-
 
 def split(element, typ):
     d = {}
@@ -87,6 +80,41 @@ def reg(directory, dims, batch):
         max_epochs=MAX_EPOCHS, early_stopping_patience=PATIENCE,
         initial_lr=INITIAL_LR, min_lr=MIN_LR,
     )
+
+
+def predict_direct(model, X, batch_size=1024):
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    module = model.model.to(device).eval()
+    loader = DataLoader(TensorDataset(torch.tensor(X, dtype=torch.float32)), batch_size=batch_size, shuffle=False)
+    preds = []
+    with torch.no_grad():
+        for (xb,) in loader:
+            preds.append(module(xb.to(device)).detach().cpu().numpy())
+    return np.concatenate(preds, axis=0)
+
+
+def best_universal_source_by_eta(target_split, label):
+    ckpts = sorted(RUNS["universal_feff"].glob("paper_*/best*.ckpt"))
+    if not ckpts:
+        raise FileNotFoundError("No UniversalXAS checkpoints found. Train UniversalXAS first.")
+
+    target = target_split.test.y
+    baseline = np.repeat(target_split.train.y.mean(axis=0, keepdims=True), len(target), axis=0)
+    baseline_median_mse = float(np.median(np.mean((target - baseline) ** 2, axis=1)))
+
+    best_eta, best_ckpt = -np.inf, None
+    XASBlock.DROPOUT = DEFAULT_DROPOUT
+    for ckpt in ckpts:
+        model = reg(ckpt.parent, UNIVERSAL_DIMS, 32)
+        model.load("best")
+        pred = predict_direct(model, target_split.test.X)
+        model_median_mse = float(np.median(np.mean((target - pred) ** 2, axis=1)))
+        eta = baseline_median_mse / model_median_mse
+        if eta > best_eta:
+            best_eta, best_ckpt = eta, ckpt
+
+    print(f"Best UniversalXAS source for {label}: eta={best_eta:.6f} | {best_ckpt}", flush=True)
+    return best_ckpt.parent
 
 
 def banner(i, total, text):
@@ -160,7 +188,7 @@ tuned = {
 for key, (label, runs, data, batch) in tuned.items():
     if key not in selected:
         continue
-    source = best(RUNS["universal_feff"], "UniversalXAS source").parent
+    source = best_universal_source_by_eta(data, label)
     ckpts = []
     for seed in seeds:
         for dropout in TUNED_DROPOUTS:

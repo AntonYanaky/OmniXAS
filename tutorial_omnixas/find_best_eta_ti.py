@@ -13,6 +13,8 @@ import shutil
 
 import numpy as np
 import pandas as pd
+import torch
+from torch.utils.data import DataLoader, TensorDataset
 
 from omnixas.data.ml_data import MLData, MLSplits
 from omnixas.model.metrics import ModelMetrics
@@ -122,6 +124,24 @@ def median_mse(y_true, y_pred) -> float:
     return float(np.median(np.mean((y_true - y_pred) ** 2, axis=1)))
 
 
+def predict_without_lightning_trainer(model: XASBlockRegressor, X: np.ndarray, batch_size: int = 1024):
+    """Single-process prediction.
+
+    XASBlockRegressor.predict() creates a Lightning Trainer. On a machine with
+    multiple visible GPUs, Lightning may auto-start DDP and return only this
+    process's shard of predictions. Direct torch inference avoids that.
+    """
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    module = model.model.to(device).eval()
+    loader = DataLoader(TensorDataset(torch.tensor(X, dtype=torch.float32)), batch_size=batch_size, shuffle=False)
+
+    preds = []
+    with torch.no_grad():
+        for (xb,) in loader:
+            preds.append(module(xb.to(device)).detach().cpu().numpy())
+    return np.concatenate(preds, axis=0)
+
+
 def evaluate_checkpoint(path: Path, hidden_dims, split: MLSplits, batch_size: int):
     model = XASBlockRegressor(
         directory=str(Path(path).parent),
@@ -134,7 +154,7 @@ def evaluate_checkpoint(path: Path, hidden_dims, split: MLSplits, batch_size: in
     )
     model.load("best")
 
-    pred = model.predict(split.test.X)
+    pred = predict_without_lightning_trainer(model, split.test.X)
     target = split.test.y
     metrics = ModelMetrics(predictions=pred, targets=target)
 
