@@ -48,17 +48,32 @@ PAPER_ETA = {
     ("Ti", "FEFF", "ExpertXAS"): 6.35,
     ("Ti", "FEFF", "UniversalXAS"): 4.19,
     ("Ti", "FEFF", "Tuned-UniversalXAS"): 7.63,
+    ("V", "FEFF", "ExpertXAS"): 7.30,
+    ("V", "FEFF", "UniversalXAS"): 5.19,
+    ("V", "FEFF", "Tuned-UniversalXAS"): 9.22,
+    ("Cr", "FEFF", "ExpertXAS"): 8.54,
+    ("Cr", "FEFF", "UniversalXAS"): 7.13,
+    ("Cr", "FEFF", "Tuned-UniversalXAS"): 10.44,
+    ("Mn", "FEFF", "ExpertXAS"): 17.66,
+    ("Mn", "FEFF", "UniversalXAS"): 13.15,
+    ("Mn", "FEFF", "Tuned-UniversalXAS"): 29.81,
+    ("Fe", "FEFF", "ExpertXAS"): 7.51,
+    ("Fe", "FEFF", "UniversalXAS"): 6.04,
+    ("Fe", "FEFF", "Tuned-UniversalXAS"): 8.98,
+    ("Co", "FEFF", "ExpertXAS"): 14.47,
+    ("Co", "FEFF", "UniversalXAS"): 9.58,
+    ("Co", "FEFF", "Tuned-UniversalXAS"): 19.83,
+    ("Ni", "FEFF", "ExpertXAS"): 8.45,
+    ("Ni", "FEFF", "UniversalXAS"): 6.43,
+    ("Ni", "FEFF", "Tuned-UniversalXAS"): 11.21,
+    ("Cu", "FEFF", "ExpertXAS"): 5.19,
+    ("Cu", "FEFF", "UniversalXAS"): 2.75,
+    ("Cu", "FEFF", "Tuned-UniversalXAS"): 4.81,
     ("Ti", "VASP", "ExpertXAS"): 4.75,
     ("Ti", "VASP", "Tuned-UniversalXAS"): 5.27,
+    ("Cu", "VASP", "ExpertXAS"): 8.46,
+    ("Cu", "VASP", "Tuned-UniversalXAS"): 9.21,
 }
-
-
-def parse_args():
-    p = argparse.ArgumentParser(description="Find best eta checkpoints in output/training.")
-    p.add_argument("--elements", nargs="+", default=["all"], help="Elements to scan, e.g. Ti Cu or all")
-    p.add_argument("--no-vasp", action="store_true", help="Only scan FEFF datasets")
-    p.add_argument("--delete-non-best", action="store_true", help="Delete non-winning run folders after evaluating")
-    return p.parse_args()
 
 
 def split_exists(element, typ):
@@ -125,7 +140,12 @@ def evaluate_checkpoint(path: Path, dims, split: MLSplits, batch_size: int):
 
 
 def main():
-    args = parse_args()
+    parser = argparse.ArgumentParser(description="Find best eta checkpoints in output/training.")
+    parser.add_argument("--elements", nargs="+", default=["all"], help="Elements to scan, e.g. Ti Cu or all")
+    parser.add_argument("--no-vasp", action="store_true", help="Only scan FEFF datasets")
+    parser.add_argument("--delete-non-best", action="store_true", help="Delete non-winning run folders after evaluating")
+    args = parser.parse_args()
+
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     torch.set_float32_matmul_precision("high")
 
