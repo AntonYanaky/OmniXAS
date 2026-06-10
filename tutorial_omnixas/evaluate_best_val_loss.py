@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Find best eta checkpoints for paper-style OmniXAS runs.
+"""Select best-validation-loss checkpoints and report test eta.
 
 Default scans all FEFF elements (Ti-Cu) plus available Ti/Cu VASP runs.
-It intentionally cherry-picks by target test-set eta.
+Selection uses exact validation loss stored inside Lightning checkpoints, not the
+rounded val_loss in checkpoint filenames and not test eta.
 """
 
 from datetime import datetime
@@ -10,6 +11,12 @@ from pathlib import Path
 import argparse
 import re
 import shutil
+
+parser = argparse.ArgumentParser(description="Select best-val-loss checkpoints and report test eta.")
+parser.add_argument("--elements", nargs="+", default=["all"], help="Elements to scan, e.g. Ti Cu or all")
+parser.add_argument("--no-vasp", action="store_true", help="Only scan FEFF datasets")
+parser.add_argument("--delete-non-best", action="store_true", help="Delete non-winning run folders after evaluating")
+args = parser.parse_args()
 
 import numpy as np
 import pandas as pd
@@ -23,22 +30,20 @@ from omnixas.model.xasblock_regressor import XASBlockRegressor
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "tutorial_omnixas" / "ml_data"
 OUTPUT_ROOT = ROOT / "output" / "training"
-RESULTS_DIR = OUTPUT_ROOT / "comparisons" / "best_eta" / datetime.now().strftime("%Y%m%d_%H%M%S")
+RESULTS_DIR = OUTPUT_ROOT / "comparisons" / "best_val_loss" / datetime.now().strftime("%Y%m%d_%H%M%S")
 
 INPUT_DIM, OUTPUT_DIM = 64, 141
 FEFF_ELEMENTS = ["Ti", "V", "Cr", "Mn", "Fe", "Co", "Ni", "Cu"]
-VASP_ELEMENTS = ["Ti", "Cu"]
 UNIVERSAL_DIMS = [500, 500, 550]
-
 FEFF_HPARAMS = {
-    "Co": {"batch_size": 32, "widths": [600, 550, 450]},
-    "Cr": {"batch_size": 32, "widths": [450, 350, 150]},
-    "Cu": {"batch_size": 32, "widths": [600, 600, 400]},
-    "Fe": {"batch_size": 64, "widths": [450, 400, 450]},
-    "Mn": {"batch_size": 64, "widths": [500, 400, 300]},
-    "Ni": {"batch_size": 32, "widths": [600, 300]},
     "Ti": {"batch_size": 32, "widths": [600, 600, 450]},
-    "V": {"batch_size": 32, "widths": [600, 550, 450]},
+    "V":  {"batch_size": 32, "widths": [600, 550, 450]},
+    "Cr": {"batch_size": 32, "widths": [450, 350, 150]},
+    "Mn": {"batch_size": 64, "widths": [500, 400, 300]},
+    "Fe": {"batch_size": 64, "widths": [450, 400, 450]},
+    "Co": {"batch_size": 32, "widths": [600, 550, 450]},
+    "Ni": {"batch_size": 32, "widths": [600, 300]},
+    "Cu": {"batch_size": 32, "widths": [600, 600, 400]},
 }
 VASP_HPARAMS = {
     "Ti": {"batch_size": 64, "widths": [500, 600, 400]},
@@ -80,139 +85,138 @@ def split_exists(element, typ):
     return (DATA_DIR / f"{element}_{typ}_test_X.txt").exists()
 
 
-def load_split(element: str, typ: str) -> MLSplits:
+def load_split(element, typ):
     return MLSplits(**{
-        s: MLData(
-            X=np.loadtxt(DATA_DIR / f"{element}_{typ}_{s}_X.txt", dtype=np.float32),
-            y=np.loadtxt(DATA_DIR / f"{element}_{typ}_{s}_y.txt", dtype=np.float32),
+        name: MLData(
+            X=np.loadtxt(DATA_DIR / f"{element}_{typ}_{name}_X.txt", dtype=np.float32),
+            y=np.loadtxt(DATA_DIR / f"{element}_{typ}_{name}_y.txt", dtype=np.float32),
         )
-        for s in ["train", "val", "test"]
+        for name in ["train", "val", "test"]
     })
 
 
-def checkpoint_paths(root: Path):
-    root = Path(root)
-    return sorted(set(root.glob("*/best*.ckpt")) | set(root.glob("*/checkpoints/best*.ckpt")))
+def run_dir(ckpt_path):
+    ckpt_path = Path(ckpt_path)
+    return ckpt_path.parent.parent if ckpt_path.parent.name == "checkpoints" else ckpt_path.parent
 
 
-def checkpoint_seed(path: Path):
-    match = re.search(r"seed(\d+)", str(path))
-    return int(match.group(1)) if match else np.nan
+def checkpoint_val_loss(ckpt_path):
+    try:
+        try:
+            ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        except TypeError:
+            ckpt = torch.load(ckpt_path, map_location="cpu")
+        scores = []
+        for callback_name, state in ckpt.get("callbacks", {}).items():
+            if "ModelCheckpoint" not in str(callback_name):
+                continue
+            score = state.get("best_model_score")
+            if score is not None:
+                scores.append(float(score.detach().cpu().item() if torch.is_tensor(score) else score))
+        if scores:
+            return min(scores)
+    except Exception as exc:
+        print(f"Warning: could not read exact val_loss from {ckpt_path}: {exc}")
 
-
-def run_dir(path: Path):
-    path = Path(path)
-    return path.parent.parent if path.parent.name == "checkpoints" else path.parent
-
-
-def evaluate_checkpoint(path: Path, dims, split: MLSplits, batch_size: int):
-    model = XASBlockRegressor(
-        directory=str(run_dir(path)),
-        overwrite_save_dir=False,
-        input_dim=INPUT_DIM,
-        output_dim=OUTPUT_DIM,
-        hidden_dims=list(dims),
-        batch_size=batch_size,
-        max_epochs=1,
-    )
-    model.load("best")
-
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    module = model.model.to(device).eval()
-    loader = DataLoader(TensorDataset(torch.tensor(split.test.X, dtype=torch.float32)), batch_size=1024, shuffle=False)
-    preds = []
-    with torch.no_grad():
-        for (xb,) in loader:
-            preds.append(module(xb.to(device)).detach().cpu().numpy())
-    pred = np.concatenate(preds, axis=0)
-
-    target = split.test.y
-    metrics = ModelMetrics(predictions=pred, targets=target)
-    baseline = np.repeat(split.train.y.mean(axis=0, keepdims=True), len(target), axis=0)
-    baseline_median = float(np.median(np.mean((target - baseline) ** 2, axis=1)))
-    model_median = float(metrics.median_of_mse_per_spectra)
-    return {
-        "mse": float(metrics.mse),
-        "median_mse": model_median,
-        "baseline_median_mse": baseline_median,
-        "eta": baseline_median / model_median,
-    }
+    match = re.search(r"val_loss[=_](\d+(?:\.\d+)?)", Path(ckpt_path).name)
+    return float(match.group(1)) if match else float("inf")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Find best eta checkpoints in output/training.")
-    parser.add_argument("--elements", nargs="+", default=["all"], help="Elements to scan, e.g. Ti Cu or all")
-    parser.add_argument("--no-vasp", action="store_true", help="Only scan FEFF datasets")
-    parser.add_argument("--delete-non-best", action="store_true", help="Delete non-winning run folders after evaluating")
-    args = parser.parse_args()
-
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    torch.set_float32_matmul_precision("high")
-
-    best_rows, audit_rows = [], []
-    best_run_dirs, candidate_run_dirs = set(), set()
-    split_cache = {}
-
     elements = FEFF_ELEMENTS if "all" in args.elements else args.elements
     specs = []
     for element in elements:
         if split_exists(element, "FEFF"):
             h = FEFF_HPARAMS[element]
-            specs += [
+            specs.extend([
                 (element, "FEFF", "ExpertXAS", OUTPUT_ROOT / "expertXAS" / f"{element}_FEFF" / "runs", h["widths"], h["batch_size"]),
                 (element, "FEFF", "UniversalXAS", OUTPUT_ROOT / "universalXAS" / "All_FEFF" / "runs", UNIVERSAL_DIMS, 32),
                 (element, "FEFF", "Tuned-UniversalXAS", OUTPUT_ROOT / "tunedUniversalXAS" / f"{element}_FEFF" / "runs", UNIVERSAL_DIMS, h["batch_size"]),
-            ]
+            ])
         if not args.no_vasp and element in VASP_HPARAMS and split_exists(element, "VASP"):
             h = VASP_HPARAMS[element]
-            specs += [
+            specs.extend([
                 (element, "VASP", "ExpertXAS", OUTPUT_ROOT / "expertXAS" / f"{element}_VASP" / "runs", h["widths"], h["batch_size"]),
                 (element, "VASP", "Tuned-UniversalXAS", OUTPUT_ROOT / "tunedUniversalXAS" / f"{element}_VASP" / "runs", UNIVERSAL_DIMS, h["batch_size"]),
-            ]
+            ])
+
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    torch.set_float32_matmul_precision("high")
+    best_rows, audit_rows = [], []
+    best_run_dirs, candidate_run_dirs = set(), set()
+    split_cache = {}
 
     for element, typ, model_name, root, dims, batch_size in specs:
-        paths = checkpoint_paths(root)
-        if not paths:
+        ckpts = sorted(set(root.glob("*/best*.ckpt")) | set(root.glob("*/checkpoints/best*.ckpt")))
+        if not ckpts:
             print(f"Skipping {element} {typ} / {model_name}: no checkpoints in {root}")
             continue
 
-        split_key = (element, typ)
-        split_cache.setdefault(split_key, load_split(*split_key))
-        split = split_cache[split_key]
+        split_cache.setdefault((element, typ), load_split(element, typ))
+        split = split_cache[(element, typ)]
+        target = split.test.y
+        baseline = np.repeat(split.train.y.mean(axis=0, keepdims=True), len(target), axis=0)
+        baseline_median = float(np.median(np.mean((target - baseline) ** 2, axis=1)))
 
         candidates = []
-        for path in paths:
-            scores = evaluate_checkpoint(path, dims, split, batch_size)
+        for ckpt in ckpts:
+            model = XASBlockRegressor(
+                directory=str(run_dir(ckpt)),
+                overwrite_save_dir=False,
+                input_dim=INPUT_DIM,
+                output_dim=OUTPUT_DIM,
+                hidden_dims=list(dims),
+                batch_size=batch_size,
+                max_epochs=1,
+            )
+            model.load("best")
+
+            device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+            module = model.model.to(device).eval()
+            loader = DataLoader(TensorDataset(torch.tensor(split.test.X, dtype=torch.float32)), batch_size=1024, shuffle=False)
+            preds = []
+            with torch.no_grad():
+                for (xb,) in loader:
+                    preds.append(module(xb.to(device)).detach().cpu().numpy())
+            pred = np.concatenate(preds, axis=0)
+
+            metrics = ModelMetrics(predictions=pred, targets=target)
+            median_mse = float(metrics.median_of_mse_per_spectra)
+            val_loss = checkpoint_val_loss(ckpt)
             row = {
-                "checkpoint_seed": checkpoint_seed(path),
+                "checkpoint_seed": int(re.search(r"seed(\d+)", str(ckpt)).group(1)) if re.search(r"seed(\d+)", str(ckpt)) else np.nan,
                 "element": element,
                 "type": typ,
                 "dataset": f"{element} {typ}",
                 "model": model_name,
-                **scores,
+                "mse": float(metrics.mse),
+                "median_mse": median_mse,
+                "baseline_median_mse": baseline_median,
+                "eta": baseline_median / median_mse,
+                "val_loss": val_loss,
                 "paper_eta": PAPER_ETA.get((element, typ, model_name), np.nan),
-                "checkpoint_path": str(path),
-                "run_dir": str(run_dir(path)),
+                "checkpoint_path": str(ckpt),
+                "run_dir": str(run_dir(ckpt)),
             }
             candidates.append(row)
             audit_rows.append(row)
 
-        candidates.sort(key=lambda r: (-r["eta"], r["median_mse"], r["checkpoint_path"]))
+        candidates.sort(key=lambda row: (row["val_loss"], row["checkpoint_path"]))
         best = candidates[0]
         best_run_dirs.add(best["run_dir"])
         candidate_run_dirs.update(row["run_dir"] for row in candidates)
         best_rows.append({k: v for k, v in best.items() if k not in {"checkpoint_path", "run_dir"}})
-        print(f"{best['dataset']} / {model_name}: eta={best['eta']:.6f}, median_mse={best['median_mse']:.6g}")
+        print(f"{best['dataset']} / {model_name}: val_loss={best['val_loss']:.8g}, test eta={best['eta']:.6f}")
         print(f"  {best['checkpoint_path']}")
 
     best_df = pd.DataFrame(best_rows)
-    audit_df = pd.DataFrame(audit_rows).sort_values(["element", "type", "model", "eta"], ascending=[True, True, True, False])
-    best_csv = RESULTS_DIR / "best_eta_results.csv"
-    audit_csv = RESULTS_DIR / "best_eta_all_candidates.csv"
+    audit_df = pd.DataFrame(audit_rows).sort_values(["element", "type", "model", "val_loss"])
+    best_csv = RESULTS_DIR / "best_val_loss_results.csv"
+    audit_csv = RESULTS_DIR / "best_val_loss_all_candidates.csv"
     best_df.to_csv(best_csv, index=False)
     audit_df.to_csv(audit_csv, index=False)
 
-    print("\nBest eta table:")
+    print("\nBest validation-loss-selected table:")
     print(best_df.to_string(index=False))
     print("\nSaved:", best_csv)
     print("Saved all candidates:", audit_csv)

@@ -6,16 +6,16 @@ Spectrum type is selected with --types because FEFF and VASP are separate datase
 
 Examples:
   # Universal foundation model; always all FEFF elements.
-  python tutorial_omnixas/train_paper_ti.py --models universal --seed 42 --gpu 0
+  python tutorial_omnixas/train_paper_models.py --models universal --seed 42 --gpu 0
 
   # FEFF experts and tuned models for all eight FEFF elements.
-  python tutorial_omnixas/train_paper_ti.py --models expert tuned --elements all --types FEFF --seed 42 --gpu 0
+  python tutorial_omnixas/train_paper_models.py --models expert tuned --elements all --types FEFF --seed 42 --gpu 0
 
   # Ti/Cu VASP experts and tuned models.
-  python tutorial_omnixas/train_paper_ti.py --models expert tuned --elements Ti Cu --types VASP --seed 42 --gpu 0
+  python tutorial_omnixas/train_paper_models.py --models expert tuned --elements Ti Cu --types VASP --seed 42 --gpu 0
 
   # Everything available.
-  python tutorial_omnixas/train_paper_ti.py --models all --elements all --types all --seed 42 --gpu 0
+  python tutorial_omnixas/train_paper_models.py --models all --elements all --types all --seed 42 --gpu 0
 """
 
 import argparse
@@ -40,7 +40,6 @@ if args.n_runs < 1:
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, TensorDataset
 from lightning.pytorch import seed_everything
 
 from omnixas.data.ml_data import MLData, MLSplits
@@ -53,7 +52,6 @@ OUT = ROOT / "output" / "training"
 
 INPUT_DIM, OUTPUT_DIM = 64, 141
 FEFF_ELEMENTS = ["Ti", "V", "Cr", "Mn", "Fe", "Co", "Ni", "Cu"]
-VASP_ELEMENTS = ["Ti", "Cu"]
 UNIVERSAL_DIMS = [500, 500, 550]
 FEFF_HPARAMS = {
     "Ti": {"batch_size": 32, "widths": [600, 600, 450]},
@@ -122,36 +120,35 @@ def reg(directory, dims, batch):
     )
 
 
-def best_universal_source_by_eta(target_split, label):
+def checkpoint_val_loss(ckpt_path):
+    try:
+        try:
+            ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        except TypeError:
+            ckpt = torch.load(ckpt_path, map_location="cpu")
+        scores = []
+        for callback_name, state in ckpt.get("callbacks", {}).items():
+            if "ModelCheckpoint" not in str(callback_name):
+                continue
+            score = state.get("best_model_score")
+            if score is not None:
+                scores.append(float(score.detach().cpu().item() if torch.is_tensor(score) else score))
+        if scores:
+            return min(scores)
+    except Exception as exc:
+        print(f"Warning: could not read exact val_loss from {ckpt_path}: {exc}", flush=True)
+
+    import re
+    match = re.search(r"val_loss[=_](\d+(?:\.\d+)?)", Path(ckpt_path).name)
+    return float(match.group(1)) if match else float("inf")
+
+
+def best_universal_source_by_val_loss(label):
     ckpts = sorted(run_root("universal").glob("paper_*/best*.ckpt"))
     if not ckpts:
         raise FileNotFoundError("No UniversalXAS checkpoints found. Train UniversalXAS first.")
-
-    target = target_split.test.y
-    baseline = np.repeat(target_split.train.y.mean(axis=0, keepdims=True), len(target), axis=0)
-    baseline_median = float(np.median(np.mean((target - baseline) ** 2, axis=1)))
-
-    best_eta, best_ckpt = -np.inf, None
-    XASBlock.DROPOUT = DEFAULT_DROPOUT
-    for ckpt in ckpts:
-        model = reg(ckpt.parent, UNIVERSAL_DIMS, 32)
-        model.load("best")
-
-        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        module = model.model.to(device).eval()
-        loader = DataLoader(TensorDataset(torch.tensor(target_split.test.X, dtype=torch.float32)), batch_size=1024, shuffle=False)
-        preds = []
-        with torch.no_grad():
-            for (xb,) in loader:
-                preds.append(module(xb.to(device)).detach().cpu().numpy())
-        pred = np.concatenate(preds, axis=0)
-
-        median_mse = float(np.median(np.mean((target - pred) ** 2, axis=1)))
-        eta = baseline_median / median_mse
-        if eta > best_eta:
-            best_eta, best_ckpt = eta, ckpt
-
-    print(f"Best UniversalXAS source for {label}: eta={best_eta:.6f} | {best_ckpt}", flush=True)
+    best_ckpt = min(ckpts, key=checkpoint_val_loss)
+    print(f"Best UniversalXAS source for {label}: val_loss={checkpoint_val_loss(best_ckpt):.8g} | {best_ckpt}", flush=True)
     return best_ckpt.parent
 
 
@@ -229,7 +226,7 @@ for element in elements:
                     torch.cuda.empty_cache()
 
         if "tuned" in models:
-            source = best_universal_source_by_eta(data, f"{element} {typ} Tuned-UniversalXAS")
+            source = best_universal_source_by_val_loss(f"{element} {typ} Tuned-UniversalXAS")
             for seed in seeds:
                 for dropout in TUNED_DROPOUTS:
                     job += 1
@@ -244,4 +241,4 @@ for element in elements:
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
 
-print("\nDone. Run: python tutorial_omnixas/find_best_eta_ti.py", flush=True)
+print("\nDone. Run: python tutorial_omnixas/evaluate_best_val_loss.py", flush=True)
