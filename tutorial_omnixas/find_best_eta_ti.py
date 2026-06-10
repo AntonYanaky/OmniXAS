@@ -61,10 +61,6 @@ def parse_args():
     return p.parse_args()
 
 
-def selected_elements(values):
-    return FEFF_ELEMENTS if "all" in values else values
-
-
 def split_exists(element, typ):
     return (DATA_DIR / f"{element}_{typ}_test_X.txt").exists()
 
@@ -94,21 +90,6 @@ def run_dir(path: Path):
     return path.parent.parent if path.parent.name == "checkpoints" else path.parent
 
 
-def predict_direct(model: XASBlockRegressor, X: np.ndarray, batch_size: int = 1024):
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    module = model.model.to(device).eval()
-    loader = DataLoader(TensorDataset(torch.tensor(X, dtype=torch.float32)), batch_size=batch_size, shuffle=False)
-    preds = []
-    with torch.no_grad():
-        for (xb,) in loader:
-            preds.append(module(xb.to(device)).detach().cpu().numpy())
-    return np.concatenate(preds, axis=0)
-
-
-def median_mse(y_true, y_pred):
-    return float(np.median(np.mean((y_true - y_pred) ** 2, axis=1)))
-
-
 def evaluate_checkpoint(path: Path, dims, split: MLSplits, batch_size: int):
     model = XASBlockRegressor(
         directory=str(run_dir(path)),
@@ -121,11 +102,19 @@ def evaluate_checkpoint(path: Path, dims, split: MLSplits, batch_size: int):
     )
     model.load("best")
 
-    pred = predict_direct(model, split.test.X)
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    module = model.model.to(device).eval()
+    loader = DataLoader(TensorDataset(torch.tensor(split.test.X, dtype=torch.float32)), batch_size=1024, shuffle=False)
+    preds = []
+    with torch.no_grad():
+        for (xb,) in loader:
+            preds.append(module(xb.to(device)).detach().cpu().numpy())
+    pred = np.concatenate(preds, axis=0)
+
     target = split.test.y
     metrics = ModelMetrics(predictions=pred, targets=target)
     baseline = np.repeat(split.train.y.mean(axis=0, keepdims=True), len(target), axis=0)
-    baseline_median = median_mse(target, baseline)
+    baseline_median = float(np.median(np.mean((target - baseline) ** 2, axis=1)))
     model_median = float(metrics.median_of_mse_per_spectra)
     return {
         "mse": float(metrics.mse),
@@ -133,25 +122,6 @@ def evaluate_checkpoint(path: Path, dims, split: MLSplits, batch_size: int):
         "baseline_median_mse": baseline_median,
         "eta": baseline_median / model_median,
     }
-
-
-def specs_for(elements, include_vasp=True):
-    specs = []
-    for el in elements:
-        if split_exists(el, "FEFF"):
-            h = FEFF_HPARAMS[el]
-            specs += [
-                (el, "FEFF", "ExpertXAS", OUTPUT_ROOT / "expertXAS" / f"{el}_FEFF" / "runs", h["widths"], h["batch_size"]),
-                (el, "FEFF", "UniversalXAS", OUTPUT_ROOT / "universalXAS" / "All_FEFF" / "runs", UNIVERSAL_DIMS, 32),
-                (el, "FEFF", "Tuned-UniversalXAS", OUTPUT_ROOT / "tunedUniversalXAS" / f"{el}_FEFF" / "runs", UNIVERSAL_DIMS, h["batch_size"]),
-            ]
-        if include_vasp and el in VASP_HPARAMS and split_exists(el, "VASP"):
-            h = VASP_HPARAMS[el]
-            specs += [
-                (el, "VASP", "ExpertXAS", OUTPUT_ROOT / "expertXAS" / f"{el}_VASP" / "runs", h["widths"], h["batch_size"]),
-                (el, "VASP", "Tuned-UniversalXAS", OUTPUT_ROOT / "tunedUniversalXAS" / f"{el}_VASP" / "runs", UNIVERSAL_DIMS, h["batch_size"]),
-            ]
-    return specs
 
 
 def main():
@@ -163,7 +133,24 @@ def main():
     best_run_dirs, candidate_run_dirs = set(), set()
     split_cache = {}
 
-    for element, typ, model_name, root, dims, batch_size in specs_for(selected_elements(args.elements), not args.no_vasp):
+    elements = FEFF_ELEMENTS if "all" in args.elements else args.elements
+    specs = []
+    for element in elements:
+        if split_exists(element, "FEFF"):
+            h = FEFF_HPARAMS[element]
+            specs += [
+                (element, "FEFF", "ExpertXAS", OUTPUT_ROOT / "expertXAS" / f"{element}_FEFF" / "runs", h["widths"], h["batch_size"]),
+                (element, "FEFF", "UniversalXAS", OUTPUT_ROOT / "universalXAS" / "All_FEFF" / "runs", UNIVERSAL_DIMS, 32),
+                (element, "FEFF", "Tuned-UniversalXAS", OUTPUT_ROOT / "tunedUniversalXAS" / f"{element}_FEFF" / "runs", UNIVERSAL_DIMS, h["batch_size"]),
+            ]
+        if not args.no_vasp and element in VASP_HPARAMS and split_exists(element, "VASP"):
+            h = VASP_HPARAMS[element]
+            specs += [
+                (element, "VASP", "ExpertXAS", OUTPUT_ROOT / "expertXAS" / f"{element}_VASP" / "runs", h["widths"], h["batch_size"]),
+                (element, "VASP", "Tuned-UniversalXAS", OUTPUT_ROOT / "tunedUniversalXAS" / f"{element}_VASP" / "runs", UNIVERSAL_DIMS, h["batch_size"]),
+            ]
+
+    for element, typ, model_name, root, dims, batch_size in specs:
         paths = checkpoint_paths(root)
         if not paths:
             print(f"Skipping {element} {typ} / {model_name}: no checkpoints in {root}")

@@ -77,22 +77,6 @@ INITIAL_LR = 1e-2
 MIN_LR = 1e-4
 
 
-def expand_models(values):
-    return ["universal", "expert", "tuned"] if "all" in values else list(dict.fromkeys(values))
-
-
-def expand_elements(values):
-    elements = FEFF_ELEMENTS if "all" in values else values
-    bad = [e for e in elements if e not in FEFF_ELEMENTS]
-    if bad:
-        raise ValueError(f"Unknown elements: {bad}. Use one of {FEFF_ELEMENTS} or all.")
-    return elements
-
-
-def expand_types(values):
-    return ["FEFF", "VASP"] if "all" in values else list(dict.fromkeys(values))
-
-
 def split_exists(element, typ):
     return (DATA / f"{element}_{typ}_train_X.txt").exists()
 
@@ -105,14 +89,6 @@ def split(element, typ):
         )
         for s in ["train", "val", "test"]
     })
-
-
-def merge_splits(splits):
-    return MLSplits(
-        train=MLData(X=np.concatenate([s.train.X for s in splits]), y=np.concatenate([s.train.y for s in splits])),
-        val=MLData(X=np.concatenate([s.val.X for s in splits]), y=np.concatenate([s.val.y for s in splits])),
-        test=MLData(X=np.concatenate([s.test.X for s in splits]), y=np.concatenate([s.test.y for s in splits])),
-    )
 
 
 def run_root(kind, element=None, typ=None):
@@ -146,17 +122,6 @@ def reg(directory, dims, batch):
     )
 
 
-def predict_direct(model, X, batch_size=1024):
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    module = model.model.to(device).eval()
-    loader = DataLoader(TensorDataset(torch.tensor(X, dtype=torch.float32)), batch_size=batch_size, shuffle=False)
-    preds = []
-    with torch.no_grad():
-        for (xb,) in loader:
-            preds.append(module(xb.to(device)).detach().cpu().numpy())
-    return np.concatenate(preds, axis=0)
-
-
 def best_universal_source_by_eta(target_split, label):
     ckpts = sorted(run_root("universal").glob("paper_*/best*.ckpt"))
     if not ckpts:
@@ -171,7 +136,16 @@ def best_universal_source_by_eta(target_split, label):
     for ckpt in ckpts:
         model = reg(ckpt.parent, UNIVERSAL_DIMS, 32)
         model.load("best")
-        pred = predict_direct(model, target_split.test.X)
+
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        module = model.model.to(device).eval()
+        loader = DataLoader(TensorDataset(torch.tensor(target_split.test.X, dtype=torch.float32)), batch_size=1024, shuffle=False)
+        preds = []
+        with torch.no_grad():
+            for (xb,) in loader:
+                preds.append(module(xb.to(device)).detach().cpu().numpy())
+        pred = np.concatenate(preds, axis=0)
+
         median_mse = float(np.median(np.mean((target - pred) ** 2, axis=1)))
         eta = baseline_median / median_mse
         if eta > best_eta:
@@ -188,9 +162,12 @@ def banner(i, total, text):
     print("=" * 90, flush=True)
 
 
-models = expand_models(args.models)
-elements = expand_elements(args.elements)
-types = expand_types(args.types)
+models = ["universal", "expert", "tuned"] if "all" in args.models else list(dict.fromkeys(args.models))
+elements = FEFF_ELEMENTS if "all" in args.elements else args.elements
+bad_elements = [e for e in elements if e not in FEFF_ELEMENTS]
+if bad_elements:
+    raise ValueError(f"Unknown elements: {bad_elements}. Use one of {FEFF_ELEMENTS} or all.")
+types = ["FEFF", "VASP"] if "all" in args.types else list(dict.fromkeys(args.types))
 seeds = ([args.seed] if args.seed is not None and args.n_runs == 1
          else [(random.Random(args.seed) if args.seed is not None else random.SystemRandom()).randint(0, 2**32 - 1) for _ in range(args.n_runs)])
 
@@ -204,7 +181,12 @@ print("Types:", types, flush=True)
 print("Seeds:", seeds, flush=True)
 
 feff_splits = {e: split(e, "FEFF") for e in FEFF_ELEMENTS if split_exists(e, "FEFF")}
-universal_split = merge_splits([feff_splits[e] for e in FEFF_ELEMENTS])
+universal_parts = [feff_splits[e] for e in FEFF_ELEMENTS]
+universal_split = MLSplits(
+    train=MLData(X=np.concatenate([s.train.X for s in universal_parts]), y=np.concatenate([s.train.y for s in universal_parts])),
+    val=MLData(X=np.concatenate([s.val.X for s in universal_parts]), y=np.concatenate([s.val.y for s in universal_parts])),
+    test=MLData(X=np.concatenate([s.test.X for s in universal_parts]), y=np.concatenate([s.test.y for s in universal_parts])),
+)
 job = 0
 
 if "universal" in models:
