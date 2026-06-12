@@ -31,6 +31,12 @@ p.add_argument("--types", nargs="+", default=["FEFF"], choices=["all", "FEFF", "
 p.add_argument("--n-runs", type=int, default=1)
 p.add_argument("--seed", type=int, default=None)
 p.add_argument("--gpu", type=str, default=None)
+p.add_argument(
+    "--tuned-lr",
+    type=float,
+    default=None,
+    help="Fine-tune LR for tuned models. Defaults to config/paper_hydra/train.yaml training.lr.",
+)
 args = p.parse_args()
 
 if args.gpu is not None:
@@ -41,6 +47,7 @@ if args.n_runs < 1:
 import numpy as np
 import torch
 from lightning.pytorch import seed_everything
+from omegaconf import OmegaConf
 
 from omnixas.data.ml_data import MLData, MLSplits
 from omnixas.model.xasblock import XASBlock
@@ -49,6 +56,7 @@ from omnixas.model.xasblock_regressor import XASBlockRegressor
 ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "tutorial_omnixas" / "ml_data"
 OUT = ROOT / "output" / "training"
+HYDRA_TRAIN_CFG = OmegaConf.load(ROOT / "config" / "paper_hydra" / "train.yaml")
 
 INPUT_DIM, OUTPUT_DIM = 64, 141
 FEFF_ELEMENTS = ["Ti", "V", "Cr", "Mn", "Fe", "Co", "Ni", "Cu"]
@@ -72,6 +80,10 @@ TUNED_DROPOUTS = [0.5, 0.0]
 MAX_EPOCHS = 1000
 PATIENCE = 25
 INITIAL_LR = 1e-3
+TUNED_INITIAL_LR = float(
+    args.tuned_lr if args.tuned_lr is not None else HYDRA_TRAIN_CFG.training.lr
+)
+TUNED_SHUFFLE = True
 MIN_LR = 1e-4
 
 
@@ -105,7 +117,15 @@ def save_dir(root, seed, dropout=None):
     return path
 
 
-def reg(directory, dims, batch):
+def reg(
+    directory,
+    dims,
+    batch,
+    *,
+    initial_lr=INITIAL_LR,
+    use_lr_finder=True,
+    shuffle=False,
+):
     return XASBlockRegressor(
         directory=str(directory),
         overwrite_save_dir=False,
@@ -115,8 +135,10 @@ def reg(directory, dims, batch):
         batch_size=batch,
         max_epochs=MAX_EPOCHS,
         early_stopping_patience=PATIENCE,
-        initial_lr=INITIAL_LR,
+        initial_lr=initial_lr,
         min_lr=MIN_LR,
+        use_lr_finder=use_lr_finder,
+        shuffle=shuffle,
     )
 
 
@@ -176,6 +198,8 @@ print("Models:", models, flush=True)
 print("Elements:", elements, flush=True)
 print("Types:", types, flush=True)
 print("Seeds:", seeds, flush=True)
+print(f"Tuned fine-tune LR from config/paper_hydra/train.yaml: {TUNED_INITIAL_LR}", flush=True)
+print(f"Tuned fine-tune DataLoader shuffle: {TUNED_SHUFFLE}", flush=True)
 
 feff_splits = {e: split(e, "FEFF") for e in FEFF_ELEMENTS if split_exists(e, "FEFF")}
 universal_parts = [feff_splits[e] for e in FEFF_ELEMENTS]
@@ -233,8 +257,21 @@ for element in elements:
                     seed_everything(seed, workers=True)
                     XASBlock.DROPOUT = dropout
                     d = save_dir(run_root("tuned", element, typ), seed, dropout)
-                    banner(job, 0, f"fine-tuning {element} {typ} Tuned-UniversalXAS | seed={seed} | dropout={dropout} | dir={d}")
-                    model = reg(source, UNIVERSAL_DIMS, hparams["batch_size"])
+                    banner(
+                        job,
+                        0,
+                        f"fine-tuning {element} {typ} Tuned-UniversalXAS | seed={seed} | "
+                        f"dropout={dropout} | lr={TUNED_INITIAL_LR} | "
+                        f"shuffle={TUNED_SHUFFLE} | dir={d}",
+                    )
+                    model = reg(
+                        source,
+                        UNIVERSAL_DIMS,
+                        hparams["batch_size"],
+                        initial_lr=TUNED_INITIAL_LR,
+                        use_lr_finder=False,
+                        shuffle=TUNED_SHUFFLE,
+                    )
                     model.load("best")
                     model.cfg.directory = str(d)
                     model.fit(data)

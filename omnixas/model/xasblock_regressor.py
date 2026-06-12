@@ -31,6 +31,8 @@ class XASBlockRegressorConfig(BaseModel):
     initial_lr: float = 1e-2
     min_lr: float = 1e-8
     batch_size: int = 128
+    use_lr_finder: bool = True
+    shuffle: bool = False
 
     # Training params
     max_epochs: int = 10
@@ -65,24 +67,29 @@ class XASBlockRegressorConfig(BaseModel):
             logger.warning(msg)
             shutil.rmtree(self.save_dir)
         os.makedirs(self.save_dir, exist_ok=True)
-        return [
-            LearningRateFinder(min_lr=self.min_lr),
-            TensorboardLogTestTrainLoss(),
-            EarlyStopping(
-                monitor="val_loss",
-                patience=self.early_stopping_patience,
-                mode="min",
-            ),
-            ModelCheckpoint(
-                dirpath=self.save_dir,
-                filename="best-model-{epoch:02d}-{val_loss:.4f}",
-                monitor="val_loss",
-                mode="min",
-                save_top_k=1,
-                auto_insert_metric_name=True,
-                save_last=True,
-            ),
-        ]
+        callbacks = []
+        if self.use_lr_finder:
+            callbacks.append(LearningRateFinder(min_lr=self.min_lr))
+        callbacks.extend(
+            [
+                TensorboardLogTestTrainLoss(),
+                EarlyStopping(
+                    monitor="val_loss",
+                    patience=self.early_stopping_patience,
+                    mode="min",
+                ),
+                ModelCheckpoint(
+                    dirpath=self.save_dir,
+                    filename="best-model-{epoch:02d}-{val_loss:.4f}",
+                    monitor="val_loss",
+                    mode="min",
+                    save_top_k=1,
+                    auto_insert_metric_name=True,
+                    save_last=True,
+                ),
+            ]
+        )
+        return callbacks
 
 
 class XASBlockRegressor:
@@ -117,6 +124,7 @@ class XASBlockRegressor:
         data_module = LightningXASData(
             ml_splits=ml_split,
             batch_size=self.cfg.batch_size,
+            shuffle=self.cfg.shuffle,
         )
         trainer.fit(self.model, data_module)
         logger.info(f"Best models saved at {self.cfg.fetch_checkpoint('best')}")
