@@ -37,6 +37,15 @@ p.add_argument(
     default=None,
     help="Fine-tune LR for tuned models. Defaults to config/paper_hydra/train.yaml training.lr.",
 )
+p.add_argument("--tuned-dropouts", nargs="+", type=float, default=None, help="Dropout values for tuned models, e.g. --tuned-dropouts 0.0")
+p.add_argument("--tuned-max-epochs", type=int, default=None, help="Max epochs for tuned models only.")
+p.add_argument("--tuned-patience", type=int, default=None, help="Early-stopping patience for tuned models only.")
+p.add_argument("--tuned-no-early-stopping", action="store_true", help="Disable early stopping for tuned models.")
+p.add_argument("--tuned-batch-size", type=int, default=None, help="Override batch size for tuned models only.")
+p.add_argument("--tuned-freeze-first-k", type=int, default=0, help="Freeze first k Linear layers during tuned fine-tuning.")
+p.add_argument("--tuned-reset-final-layer", action="store_true", help="Reinitialize final Linear layer before tuned fine-tuning.")
+p.add_argument("--tuned-reset-bn", action="store_true", help="Reset BatchNorm running stats before tuned fine-tuning.")
+p.add_argument("--tuned-monitor", choices=["val_loss", "val_median_mse"], default="val_median_mse", help="Checkpoint/early-stop monitor for tuned models.")
 args = p.parse_args()
 
 if args.gpu is not None:
@@ -76,14 +85,22 @@ VASP_HPARAMS = {
     "Cu": {"batch_size": 64, "widths": [550, 600, 450]},
 }
 DEFAULT_DROPOUT = 0.5
-TUNED_DROPOUTS = [0.5, 0.0]
+TUNED_DROPOUTS = list(args.tuned_dropouts) if args.tuned_dropouts is not None else [0.5, 0.0]
 MAX_EPOCHS = 1000
 PATIENCE = 25
 INITIAL_LR = 1e-3
 TUNED_INITIAL_LR = float(
     args.tuned_lr if args.tuned_lr is not None else HYDRA_TRAIN_CFG.training.lr
 )
+TUNED_MAX_EPOCHS = args.tuned_max_epochs if args.tuned_max_epochs is not None else MAX_EPOCHS
+TUNED_PATIENCE = args.tuned_patience if args.tuned_patience is not None else PATIENCE
+TUNED_USE_EARLY_STOPPING = not args.tuned_no_early_stopping
+TUNED_BATCH_SIZE = args.tuned_batch_size
 TUNED_SHUFFLE = True
+TUNED_FREEZE_FIRST_K = args.tuned_freeze_first_k
+TUNED_RESET_FINAL_LAYER = args.tuned_reset_final_layer
+TUNED_RESET_BN = args.tuned_reset_bn
+TUNED_MONITOR = args.tuned_monitor
 MIN_LR = 1e-4
 
 
@@ -108,10 +125,16 @@ def run_root(kind, element=None, typ=None):
     return OUT / folder / f"{element}_{typ}" / "runs"
 
 
-def save_dir(root, seed, dropout=None):
+def label_value(value):
+    return str(value).replace("-", "m").replace(".", "p")
+
+
+def save_dir(root, seed, dropout=None, extra=None):
     name = f"paper_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_seed{seed}"
     if dropout is not None:
-        name += f"_dropout{str(dropout).replace('.', 'p')}"
+        name += f"_dropout{label_value(dropout)}"
+    if extra:
+        name += f"_{extra}"
     path = Path(root) / name
     path.mkdir(parents=True, exist_ok=False)
     return path
@@ -125,6 +148,10 @@ def reg(
     initial_lr=INITIAL_LR,
     use_lr_finder=True,
     shuffle=False,
+    max_epochs=MAX_EPOCHS,
+    early_stopping_patience=PATIENCE,
+    use_early_stopping=True,
+    monitor_metric="val_loss",
 ):
     return XASBlockRegressor(
         directory=str(directory),
@@ -133,11 +160,13 @@ def reg(
         output_dim=OUTPUT_DIM,
         hidden_dims=list(dims),
         batch_size=batch,
-        max_epochs=MAX_EPOCHS,
-        early_stopping_patience=PATIENCE,
+        max_epochs=max_epochs,
+        early_stopping_patience=early_stopping_patience,
         initial_lr=initial_lr,
         min_lr=MIN_LR,
         use_lr_finder=use_lr_finder,
+        use_early_stopping=use_early_stopping,
+        monitor_metric=monitor_metric,
         shuffle=shuffle,
     )
 
@@ -174,6 +203,37 @@ def best_universal_source_by_val_loss(label):
     return best_ckpt.parent
 
 
+def tuned_extra_label(batch_size):
+    parts = [f"lr{label_value(TUNED_INITIAL_LR)}", f"bs{batch_size}", f"mon{TUNED_MONITOR}"]
+    parts.append(f"pat{TUNED_PATIENCE}" if TUNED_USE_EARLY_STOPPING else "noES")
+    if TUNED_FREEZE_FIRST_K:
+        parts.append(f"freeze{TUNED_FREEZE_FIRST_K}")
+    if TUNED_RESET_FINAL_LAYER:
+        parts.append("resetFinal")
+    if TUNED_RESET_BN:
+        parts.append("resetBN")
+    return "_".join(parts)
+
+
+def apply_tuned_transfer_options(pl_module):
+    if not (TUNED_FREEZE_FIRST_K or TUNED_RESET_FINAL_LAYER or TUNED_RESET_BN):
+        return
+    linears = [m for m in pl_module.modules() if isinstance(m, torch.nn.Linear)]
+    batchnorms = [m for m in pl_module.modules() if isinstance(m, torch.nn.BatchNorm1d)]
+    if TUNED_RESET_BN:
+        for bn in batchnorms:
+            bn.reset_running_stats()
+        print(f"Reset {len(batchnorms)} BatchNorm running-stat objects", flush=True)
+    if TUNED_RESET_FINAL_LAYER and linears:
+        linears[-1].reset_parameters()
+        print("Reset final Linear layer", flush=True)
+    if TUNED_FREEZE_FIRST_K:
+        for layer in linears[:TUNED_FREEZE_FIRST_K]:
+            for param in layer.parameters():
+                param.requires_grad = False
+        print(f"Froze first {min(TUNED_FREEZE_FIRST_K, len(linears))} Linear layers", flush=True)
+
+
 def banner(i, total, text):
     print("\n" + "=" * 90, flush=True)
     prefix = f"JOB {i}/{total}" if total else f"JOB {i}"
@@ -199,7 +259,17 @@ print("Elements:", elements, flush=True)
 print("Types:", types, flush=True)
 print("Seeds:", seeds, flush=True)
 print(f"Tuned fine-tune LR from config/paper_hydra/train.yaml: {TUNED_INITIAL_LR}", flush=True)
+print(f"Tuned dropouts: {TUNED_DROPOUTS}", flush=True)
+print(f"Tuned max epochs: {TUNED_MAX_EPOCHS}", flush=True)
+print(f"Tuned early stopping: {TUNED_USE_EARLY_STOPPING} | patience={TUNED_PATIENCE}", flush=True)
+print(f"Tuned monitor metric: {TUNED_MONITOR}", flush=True)
+print(f"Tuned batch override: {TUNED_BATCH_SIZE}", flush=True)
 print(f"Tuned fine-tune DataLoader shuffle: {TUNED_SHUFFLE}", flush=True)
+print(
+    f"Tuned transfer options: freeze_first_k={TUNED_FREEZE_FIRST_K}, "
+    f"reset_final_layer={TUNED_RESET_FINAL_LAYER}, reset_bn={TUNED_RESET_BN}",
+    flush=True,
+)
 
 feff_splits = {e: split(e, "FEFF") for e in FEFF_ELEMENTS if split_exists(e, "FEFF")}
 universal_parts = [feff_splits[e] for e in FEFF_ELEMENTS]
@@ -256,23 +326,33 @@ for element in elements:
                     job += 1
                     seed_everything(seed, workers=True)
                     XASBlock.DROPOUT = dropout
-                    d = save_dir(run_root("tuned", element, typ), seed, dropout)
+                    tuned_batch_size = TUNED_BATCH_SIZE or hparams["batch_size"]
+                    extra = tuned_extra_label(tuned_batch_size)
+                    d = save_dir(run_root("tuned", element, typ), seed, dropout, extra)
                     banner(
                         job,
                         0,
                         f"fine-tuning {element} {typ} Tuned-UniversalXAS | seed={seed} | "
-                        f"dropout={dropout} | lr={TUNED_INITIAL_LR} | "
-                        f"shuffle={TUNED_SHUFFLE} | dir={d}",
+                        f"dropout={dropout} | lr={TUNED_INITIAL_LR} | bs={tuned_batch_size} | "
+                        f"early_stop={TUNED_USE_EARLY_STOPPING} | patience={TUNED_PATIENCE} | "
+                        f"monitor={TUNED_MONITOR} | shuffle={TUNED_SHUFFLE} | "
+                        f"freeze_first_k={TUNED_FREEZE_FIRST_K} | "
+                        f"reset_final={TUNED_RESET_FINAL_LAYER} | reset_bn={TUNED_RESET_BN} | dir={d}",
                     )
                     model = reg(
                         source,
                         UNIVERSAL_DIMS,
-                        hparams["batch_size"],
+                        tuned_batch_size,
                         initial_lr=TUNED_INITIAL_LR,
                         use_lr_finder=False,
                         shuffle=TUNED_SHUFFLE,
+                        max_epochs=TUNED_MAX_EPOCHS,
+                        early_stopping_patience=TUNED_PATIENCE,
+                        use_early_stopping=TUNED_USE_EARLY_STOPPING,
+                        monitor_metric=TUNED_MONITOR,
                     )
                     model.load("best")
+                    apply_tuned_transfer_options(model.model)
                     model.cfg.directory = str(d)
                     model.fit(data)
                     if torch.cuda.is_available():

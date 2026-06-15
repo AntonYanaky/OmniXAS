@@ -90,6 +90,7 @@ class PlModule(lightning.LightningModule):
         self.optimizer = optimizer
         self.loss = loss_metric()
         self.model = model
+        self._val_spectral_mse = []
 
     def configure_optimizers(self):
         return self.optimizer(self.parameters(), lr=self.lr)
@@ -106,9 +107,19 @@ class PlModule(lightning.LightningModule):
         x, y = batch
         return self.logged_loss("train_loss", y, self.model(x))
 
+    def on_validation_epoch_start(self):
+        self._val_spectral_mse = []
+
     def validation_step(self, batch, batch_idx):
         x, y = batch
-        return self.logged_loss("val_loss", y, self.model(x))
+        y_pred = self.model(x)
+        self._val_spectral_mse.append(torch.mean((y - y_pred) ** 2, dim=1).detach())
+        return self.logged_loss("val_loss", y, y_pred)
+
+    def on_validation_epoch_end(self):
+        if self._val_spectral_mse:
+            val_median_mse = torch.cat(self._val_spectral_mse).median()
+            self.log("val_median_mse", val_median_mse, on_step=False, on_epoch=True)
 
     def test_step(self, batch, batch_idx):
         x, y = batch

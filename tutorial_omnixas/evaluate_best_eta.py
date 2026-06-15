@@ -171,7 +171,7 @@ def parse_seed(path):
 
 
 def parse_dropout(path):
-    match = re.search(r"dropout([^/\\]+)", str(path))
+    match = re.search(r"dropout([^_/\\]+)", str(path))
     return match.group(1) if match else ""
 
 
@@ -262,14 +262,38 @@ def main():
 
     best_df = pd.DataFrame(best_rows)
     audit_df = pd.DataFrame(audit_rows).sort_values(["element", "type", "model", "selection_eta"], ascending=[True, True, True, False])
+    compact_df = best_df.copy()
+    compact_df["eta_minus_paper"] = compact_df["eta"] - compact_df["paper_eta"]
+    compact_df["eta_vs_paper_pct"] = 100.0 * compact_df["eta_minus_paper"] / compact_df["paper_eta"]
+    compact_cols = [
+        "dataset",
+        "model",
+        "checkpoint_seed",
+        "dropout",
+        "selection_eta",
+        "eta",
+        "paper_eta",
+        "eta_minus_paper",
+        "eta_vs_paper_pct",
+        "median_mse",
+        "val_loss",
+    ]
+    compact_cols = [c for c in compact_cols if c in compact_df.columns]
+    compact_df = compact_df[compact_cols]
+
     best_csv = RESULTS_DIR / f"best_{args.select_split}_eta_results.csv"
+    compact_csv = RESULTS_DIR / f"best_{args.select_split}_eta_compact.csv"
     audit_csv = RESULTS_DIR / f"best_{args.select_split}_eta_all_candidates.csv"
     best_df.to_csv(best_csv, index=False)
+    compact_df.to_csv(compact_csv, index=False)
     audit_df.to_csv(audit_csv, index=False)
 
-    print(f"\nBest {args.select_split}-eta-selected table, reporting {args.report_split} eta:")
+    print(f"\nCompact {args.select_split}-eta-selected table, reporting {args.report_split} eta:")
+    print(compact_df.to_string(index=False, float_format=lambda x: f"{x:.4f}"))
+    print(f"\nFull {args.select_split}-eta-selected table, reporting {args.report_split} eta:")
     print(best_df.to_string(index=False))
     print("\nSaved:", best_csv)
+    print("Saved compact:", compact_csv)
     print("Saved all candidates:", audit_csv)
 
     prune_dirs = sorted(Path(p) for p in (candidate_run_dirs - best_run_dirs))

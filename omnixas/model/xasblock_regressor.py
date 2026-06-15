@@ -32,6 +32,8 @@ class XASBlockRegressorConfig(BaseModel):
     min_lr: float = 1e-8
     batch_size: int = 128
     use_lr_finder: bool = True
+    use_early_stopping: bool = True
+    monitor_metric: str = "val_loss"
     shuffle: bool = False
 
     # Training params
@@ -70,24 +72,25 @@ class XASBlockRegressorConfig(BaseModel):
         callbacks = []
         if self.use_lr_finder:
             callbacks.append(LearningRateFinder(min_lr=self.min_lr))
-        callbacks.extend(
-            [
-                TensorboardLogTestTrainLoss(),
+        callbacks.append(TensorboardLogTestTrainLoss())
+        if self.use_early_stopping:
+            callbacks.append(
                 EarlyStopping(
-                    monitor="val_loss",
+                    monitor=self.monitor_metric,
                     patience=self.early_stopping_patience,
                     mode="min",
-                ),
-                ModelCheckpoint(
-                    dirpath=self.save_dir,
-                    filename="best-model-{epoch:02d}-{val_loss:.4f}",
-                    monitor="val_loss",
-                    mode="min",
-                    save_top_k=1,
-                    auto_insert_metric_name=True,
-                    save_last=True,
-                ),
-            ]
+                )
+            )
+        callbacks.append(
+            ModelCheckpoint(
+                dirpath=self.save_dir,
+                filename=f"best-model-{{epoch:02d}}-{{{self.monitor_metric}:.4f}}",
+                monitor=self.monitor_metric,
+                mode="min",
+                save_top_k=1,
+                auto_insert_metric_name=True,
+                save_last=True,
+            )
         )
         return callbacks
 
