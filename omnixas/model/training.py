@@ -1,7 +1,7 @@
 # %%
 
 import numpy as np
-from typing import Callable, Optional
+from typing import Callable, Optional, Dict, Any
 
 import hydra
 import lightning
@@ -84,16 +84,36 @@ class PlModule(lightning.LightningModule):
         loss_metric: Callable[[], torch.nn.Module] = torch.nn.MSELoss,
         optimizer: Callable = torch.optim.Adam,
         lr: Optional[float] = 0.0001,
+        lr_scheduler: Optional[Callable] = None,
+        lr_scheduler_kwargs: Optional[Dict[str, Any]] = None,
+        lr_scheduler_interval: str = "epoch",
+        lr_scheduler_monitor: Optional[str] = None,
     ):
         super().__init__()
         self.lr = lr
         self.optimizer = optimizer
+        self.lr_scheduler = lr_scheduler
+        self.lr_scheduler_kwargs = lr_scheduler_kwargs or {}
+        self.lr_scheduler_interval = lr_scheduler_interval
+        self.lr_scheduler_monitor = lr_scheduler_monitor
         self.loss = loss_metric()
         self.model = model
         self._val_spectral_mse = []
 
     def configure_optimizers(self):
-        return self.optimizer(self.parameters(), lr=self.lr)
+        optimizer = self.optimizer(self.parameters(), lr=self.lr)
+        if self.lr_scheduler is None:
+            return optimizer
+
+        scheduler = self.lr_scheduler(optimizer, **self.lr_scheduler_kwargs)
+        scheduler_config = {
+            "scheduler": scheduler,
+            "interval": self.lr_scheduler_interval,
+            "frequency": 1,
+        }
+        if self.lr_scheduler_monitor is not None:
+            scheduler_config["monitor"] = self.lr_scheduler_monitor
+        return {"optimizer": optimizer, "lr_scheduler": scheduler_config}
 
     def forward(self, x):
         return self.model(x)

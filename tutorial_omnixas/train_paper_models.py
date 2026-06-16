@@ -46,6 +46,7 @@ p.add_argument("--tuned-freeze-first-k", type=int, default=0, help="Freeze first
 p.add_argument("--tuned-reset-final-layer", action="store_true", help="Reinitialize final Linear layer before tuned fine-tuning.")
 p.add_argument("--tuned-reset-bn", action="store_true", help="Reset BatchNorm running stats before tuned fine-tuning.")
 p.add_argument("--tuned-monitor", choices=["val_loss", "val_median_mse"], default="val_median_mse", help="Checkpoint/early-stop monitor for tuned models.")
+p.add_argument("--tuned-cosine-lr", action="store_true", help="Use CosineAnnealingLR for tuned fine-tuning. Defaults: T_max=250 for FEFF, 600 for VASP; eta_min=1e-6.")
 args = p.parse_args()
 
 if args.gpu is not None:
@@ -101,6 +102,8 @@ TUNED_FREEZE_FIRST_K = args.tuned_freeze_first_k
 TUNED_RESET_FINAL_LAYER = args.tuned_reset_final_layer
 TUNED_RESET_BN = args.tuned_reset_bn
 TUNED_MONITOR = args.tuned_monitor
+TUNED_LR_SCHEDULER = "cosine" if args.tuned_cosine_lr else "none"
+TUNED_COSINE_ETA_MIN = 1e-6
 MIN_LR = 1e-4
 
 
@@ -152,6 +155,9 @@ def reg(
     early_stopping_patience=PATIENCE,
     use_early_stopping=True,
     monitor_metric="val_loss",
+    lr_scheduler="none",
+    cosine_t_max=None,
+    cosine_eta_min=1e-6,
 ):
     return XASBlockRegressor(
         directory=str(directory),
@@ -168,6 +174,9 @@ def reg(
         use_early_stopping=use_early_stopping,
         monitor_metric=monitor_metric,
         shuffle=shuffle,
+        lr_scheduler=lr_scheduler,
+        cosine_t_max=cosine_t_max,
+        cosine_eta_min=cosine_eta_min,
     )
 
 
@@ -203,8 +212,17 @@ def best_universal_source_by_val_loss(label):
     return best_ckpt.parent
 
 
-def tuned_extra_label(batch_size):
+def default_tuned_cosine_t_max(typ):
+    return 250 if typ == "FEFF" else 600
+
+
+def tuned_extra_label(batch_size, typ):
     parts = [f"lr{label_value(TUNED_INITIAL_LR)}", f"bs{batch_size}", f"mon{TUNED_MONITOR}"]
+    if TUNED_LR_SCHEDULER == "cosine":
+        parts.extend([
+            f"cosT{default_tuned_cosine_t_max(typ)}",
+            f"eta{label_value(TUNED_COSINE_ETA_MIN)}",
+        ])
     parts.append(f"pat{TUNED_PATIENCE}" if TUNED_USE_EARLY_STOPPING else "noES")
     if TUNED_FREEZE_FIRST_K:
         parts.append(f"freeze{TUNED_FREEZE_FIRST_K}")
@@ -263,6 +281,7 @@ print(f"Tuned dropouts: {TUNED_DROPOUTS}", flush=True)
 print(f"Tuned max epochs: {TUNED_MAX_EPOCHS}", flush=True)
 print(f"Tuned early stopping: {TUNED_USE_EARLY_STOPPING} | patience={TUNED_PATIENCE}", flush=True)
 print(f"Tuned monitor metric: {TUNED_MONITOR}", flush=True)
+print(f"Tuned LR scheduler: {TUNED_LR_SCHEDULER}", flush=True)
 print(f"Tuned batch override: {TUNED_BATCH_SIZE}", flush=True)
 print(f"Tuned fine-tune DataLoader shuffle: {TUNED_SHUFFLE}", flush=True)
 print(
@@ -327,16 +346,18 @@ for element in elements:
                     seed_everything(seed, workers=True)
                     XASBlock.DROPOUT = dropout
                     tuned_batch_size = TUNED_BATCH_SIZE or hparams["batch_size"]
-                    extra = tuned_extra_label(tuned_batch_size)
+                    extra = tuned_extra_label(tuned_batch_size, typ)
                     d = save_dir(run_root("tuned", element, typ), seed, dropout, extra)
+                    tuned_cosine_t_max = default_tuned_cosine_t_max(typ) if TUNED_LR_SCHEDULER == "cosine" else None
                     banner(
                         job,
                         0,
                         f"fine-tuning {element} {typ} Tuned-UniversalXAS | seed={seed} | "
                         f"dropout={dropout} | lr={TUNED_INITIAL_LR} | bs={tuned_batch_size} | "
                         f"early_stop={TUNED_USE_EARLY_STOPPING} | patience={TUNED_PATIENCE} | "
-                        f"monitor={TUNED_MONITOR} | shuffle={TUNED_SHUFFLE} | "
-                        f"freeze_first_k={TUNED_FREEZE_FIRST_K} | "
+                        f"monitor={TUNED_MONITOR} | scheduler={TUNED_LR_SCHEDULER} | "
+                        f"cosine_t_max={tuned_cosine_t_max} | cosine_eta_min={TUNED_COSINE_ETA_MIN} | "
+                        f"shuffle={TUNED_SHUFFLE} | freeze_first_k={TUNED_FREEZE_FIRST_K} | "
                         f"reset_final={TUNED_RESET_FINAL_LAYER} | reset_bn={TUNED_RESET_BN} | dir={d}",
                     )
                     model = reg(
@@ -350,6 +371,9 @@ for element in elements:
                         early_stopping_patience=TUNED_PATIENCE,
                         use_early_stopping=TUNED_USE_EARLY_STOPPING,
                         monitor_metric=TUNED_MONITOR,
+                        lr_scheduler=TUNED_LR_SCHEDULER,
+                        cosine_t_max=tuned_cosine_t_max,
+                        cosine_eta_min=TUNED_COSINE_ETA_MIN,
                     )
                     model.load("best")
                     apply_tuned_transfer_options(model.model)

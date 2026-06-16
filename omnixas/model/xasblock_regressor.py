@@ -1,7 +1,7 @@
 import os
 import re
 import shutil
-from typing import List, Literal
+from typing import List, Literal, Optional
 
 import numpy as np
 import torch
@@ -32,6 +32,9 @@ class XASBlockRegressorConfig(BaseModel):
     min_lr: float = 1e-8
     batch_size: int = 128
     use_lr_finder: bool = True
+    lr_scheduler: Literal["none", "cosine"] = "none"
+    cosine_t_max: Optional[int] = None
+    cosine_eta_min: float = 1e-6
     use_early_stopping: bool = True
     monitor_metric: str = "val_loss"
     shuffle: bool = False
@@ -107,8 +110,22 @@ class XASBlockRegressor:
                 hidden_dims=self.cfg.hidden_dims,
                 output_dim=self.cfg.output_dim,
             ),
-            lr=self.cfg.initial_lr,
+            **self._pl_module_kwargs,
         )
+
+    @property
+    def _pl_module_kwargs(self):
+        kwargs = {"lr": self.cfg.initial_lr}
+        if self.cfg.lr_scheduler == "cosine":
+            kwargs.update(
+                lr_scheduler=torch.optim.lr_scheduler.CosineAnnealingLR,
+                lr_scheduler_kwargs={
+                    "T_max": self.cfg.cosine_t_max or self.cfg.max_epochs,
+                    "eta_min": self.cfg.cosine_eta_min,
+                },
+                lr_scheduler_interval="epoch",
+            )
+        return kwargs
 
     @property
     def trainer(self):
@@ -157,6 +174,6 @@ class XASBlockRegressor:
                 hidden_dims=self.cfg.hidden_dims,
                 output_dim=self.cfg.output_dim,
             ),
-            lr=self.cfg.initial_lr,
+            **self._pl_module_kwargs,
         )
         return self
