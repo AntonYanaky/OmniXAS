@@ -46,7 +46,9 @@ p.add_argument("--tuned-freeze-first-k", type=int, default=0, help="Freeze first
 p.add_argument("--tuned-reset-final-layer", action="store_true", help="Reinitialize final Linear layer before tuned fine-tuning.")
 p.add_argument("--tuned-reset-bn", action="store_true", help="Reset BatchNorm running stats before tuned fine-tuning.")
 p.add_argument("--tuned-monitor", choices=["val_loss", "val_median_mse"], default="val_median_mse", help="Checkpoint/early-stop monitor for tuned models.")
-p.add_argument("--tuned-cosine-lr", action="store_true", help="Use CosineAnnealingLR for tuned fine-tuning. Defaults: T_max=250 for FEFF, 600 for VASP; eta_min=1e-6.")
+p.add_argument("--tuned-cosine-lr", "--cos-lr", action="store_true", dest="tuned_cosine_lr", help="Use CosineAnnealingLR for tuned fine-tuning. Defaults: T_max=250 for FEFF, 600 for VASP; eta_min=1e-6.")
+p.add_argument("--cos-t", type=int, default=None, help="Override tuned CosineAnnealingLR T_max.")
+p.add_argument("--tuned-source-val-eta", action="store_true", help="Select the UniversalXAS source by target validation eta instead of universal validation loss.")
 args = p.parse_args()
 
 if args.gpu is not None:
@@ -103,6 +105,8 @@ TUNED_RESET_FINAL_LAYER = args.tuned_reset_final_layer
 TUNED_RESET_BN = args.tuned_reset_bn
 TUNED_MONITOR = args.tuned_monitor
 TUNED_LR_SCHEDULER = "cosine" if args.tuned_cosine_lr else "none"
+TUNED_SOURCE_SELECTION = "target_val_eta" if args.tuned_source_val_eta else "val_loss"
+TUNED_COSINE_T_MAX = args.cos_t
 TUNED_COSINE_ETA_MIN = 1e-6
 MIN_LR = 1e-4
 
@@ -208,16 +212,51 @@ def best_universal_source_by_val_loss(label):
     if not ckpts:
         raise FileNotFoundError("No UniversalXAS checkpoints found. Train UniversalXAS first.")
     best_ckpt = min(ckpts, key=checkpoint_val_loss)
-    print(f"Best UniversalXAS source for {label}: val_loss={checkpoint_val_loss(best_ckpt):.8g} | {best_ckpt}", flush=True)
+    print(f"Best UniversalXAS source for {label}: universal_val_loss={checkpoint_val_loss(best_ckpt):.8g} | {best_ckpt}", flush=True)
+    return best_ckpt.parent
+
+
+def predict_with_checkpoint(ckpt, split):
+    model = reg(ckpt.parent, UNIVERSAL_DIMS, 32, use_lr_finder=False, max_epochs=1)
+    model.load("best")
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    module = model.model.to(device).eval()
+    with torch.no_grad():
+        X = torch.tensor(split.val.X, dtype=torch.float32, device=device)
+        return module(X).detach().cpu().numpy()
+
+
+def val_eta_for_checkpoint(ckpt, split):
+    pred = predict_with_checkpoint(ckpt, split)
+    target = split.val.y
+    baseline = np.repeat(split.train.y.mean(axis=0, keepdims=True), len(target), axis=0)
+    baseline_median = float(np.median(np.mean((target - baseline) ** 2, axis=1)))
+    median_mse = float(np.median(np.mean((target - pred) ** 2, axis=1)))
+    return baseline_median / median_mse
+
+
+def best_universal_source_by_val_eta(label, split):
+    ckpts = sorted(run_root("universal").glob("paper_*/best*.ckpt"))
+    if not ckpts:
+        raise FileNotFoundError("No UniversalXAS checkpoints found. Train UniversalXAS first.")
+    scored = [(val_eta_for_checkpoint(ckpt, split), checkpoint_val_loss(ckpt), ckpt) for ckpt in ckpts]
+    best_eta, best_val_loss, best_ckpt = max(scored, key=lambda row: row[0])
+    print(
+        f"Best UniversalXAS source for {label}: val_eta={best_eta:.6f}, "
+        f"universal_val_loss={best_val_loss:.8g} | {best_ckpt}",
+        flush=True,
+    )
     return best_ckpt.parent
 
 
 def default_tuned_cosine_t_max(typ):
-    return 250 if typ == "FEFF" else 600
+    return TUNED_COSINE_T_MAX or (250 if typ == "FEFF" else 600)
 
 
 def tuned_extra_label(batch_size, typ):
     parts = [f"lr{label_value(TUNED_INITIAL_LR)}", f"bs{batch_size}", f"mon{TUNED_MONITOR}"]
+    if TUNED_SOURCE_SELECTION == "target_val_eta":
+        parts.append("srcValEta")
     if TUNED_LR_SCHEDULER == "cosine":
         parts.extend([
             f"cosT{default_tuned_cosine_t_max(typ)}",
@@ -282,6 +321,8 @@ print(f"Tuned max epochs: {TUNED_MAX_EPOCHS}", flush=True)
 print(f"Tuned early stopping: {TUNED_USE_EARLY_STOPPING} | patience={TUNED_PATIENCE}", flush=True)
 print(f"Tuned monitor metric: {TUNED_MONITOR}", flush=True)
 print(f"Tuned LR scheduler: {TUNED_LR_SCHEDULER}", flush=True)
+print(f"Tuned cosine T_max override: {TUNED_COSINE_T_MAX}", flush=True)
+print(f"Tuned UniversalXAS source selection: {TUNED_SOURCE_SELECTION}", flush=True)
 print(f"Tuned batch override: {TUNED_BATCH_SIZE}", flush=True)
 print(f"Tuned fine-tune DataLoader shuffle: {TUNED_SHUFFLE}", flush=True)
 print(
@@ -339,7 +380,12 @@ for element in elements:
                     torch.cuda.empty_cache()
 
         if "tuned" in models:
-            source = best_universal_source_by_val_loss(f"{element} {typ} Tuned-UniversalXAS")
+            label = f"{element} {typ} Tuned-UniversalXAS"
+            source = (
+                best_universal_source_by_val_eta(label, data)
+                if TUNED_SOURCE_SELECTION == "target_val_eta"
+                else best_universal_source_by_val_loss(label)
+            )
             for seed in seeds:
                 for dropout in TUNED_DROPOUTS:
                     job += 1
