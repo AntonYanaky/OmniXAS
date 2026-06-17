@@ -332,12 +332,11 @@ def best_universal_source_by_val_loss(label, split):
     source_info = {
         "universal_source_selection": "val_loss",
         "universal_source_val_loss": checkpoint_val_loss(best_ckpt),
-        "universal_source_target_val_eta": val_eta_for_checkpoint(best_ckpt, split),
+        "universal_source_target_val_eta": "not_computed",
     }
     print(
         f"Best UniversalXAS source for {label}: "
-        f"universal_val_loss={source_info['universal_source_val_loss']:.8g}, "
-        f"target_val_eta={source_info['universal_source_target_val_eta']:.6f} | {best_ckpt}",
+        f"universal_val_loss={source_info['universal_source_val_loss']:.8g} | {best_ckpt}",
         flush=True,
     )
     return best_ckpt.parent, source_info
