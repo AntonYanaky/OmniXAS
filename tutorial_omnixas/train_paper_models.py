@@ -254,21 +254,9 @@ def default_tuned_cosine_t_max(typ):
 
 
 def tuned_extra_label(batch_size, typ):
-    parts = [f"lr{label_value(TUNED_INITIAL_LR)}", f"bs{batch_size}", f"mon{TUNED_MONITOR}"]
-    if TUNED_SOURCE_SELECTION == "target_val_eta":
-        parts.append("srcValEta")
+    parts = [f"lr{label_value(TUNED_INITIAL_LR)}"]
     if TUNED_LR_SCHEDULER == "cosine":
-        parts.extend([
-            f"cosT{default_tuned_cosine_t_max(typ)}",
-            f"eta{label_value(TUNED_COSINE_ETA_MIN)}",
-        ])
-    parts.append(f"pat{TUNED_PATIENCE}" if TUNED_USE_EARLY_STOPPING else "noES")
-    if TUNED_FREEZE_FIRST_K:
-        parts.append(f"freeze{TUNED_FREEZE_FIRST_K}")
-    if TUNED_RESET_FINAL_LAYER:
-        parts.append("resetFinal")
-    if TUNED_RESET_BN:
-        parts.append("resetBN")
+        parts.append(f"cosT{default_tuned_cosine_t_max(typ)}")
     return "_".join(parts)
 
 
