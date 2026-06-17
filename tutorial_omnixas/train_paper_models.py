@@ -48,6 +48,7 @@ p.add_argument("--tuned-reset-bn", action="store_true", help="Reset BatchNorm ru
 p.add_argument("--tuned-monitor", choices=["val_loss", "val_median_mse"], default="val_median_mse", help="Checkpoint/early-stop monitor for tuned models.")
 p.add_argument("--tuned-cosine-lr", "--cos-lr", action="store_true", dest="tuned_cosine_lr", help="Use CosineAnnealingLR for tuned fine-tuning. Defaults: T_max=250 for FEFF, 600 for VASP; eta_min=1e-6.")
 p.add_argument("--cos-t", type=int, default=None, help="Override tuned CosineAnnealingLR T_max.")
+p.add_argument("--plateau-lr", action="store_true", help="Use ReduceLROnPlateau for tuned fine-tuning.")
 p.add_argument("--tuned-source-val-eta", action="store_true", help="Select the UniversalXAS source by target validation eta instead of universal validation loss.")
 args = p.parse_args()
 
@@ -55,6 +56,8 @@ if args.gpu is not None:
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
 if args.n_runs < 1:
     raise ValueError("--n-runs must be >= 1")
+if args.tuned_cosine_lr and args.plateau_lr:
+    raise ValueError("Use only one LR scheduler: --cos-lr or --plateau-lr")
 
 import numpy as np
 import torch
@@ -104,7 +107,7 @@ TUNED_FREEZE_FIRST_K = args.tuned_freeze_first_k
 TUNED_RESET_FINAL_LAYER = args.tuned_reset_final_layer
 TUNED_RESET_BN = args.tuned_reset_bn
 TUNED_MONITOR = args.tuned_monitor
-TUNED_LR_SCHEDULER = "cosine" if args.tuned_cosine_lr else "none"
+TUNED_LR_SCHEDULER = "cosine" if args.tuned_cosine_lr else "plateau" if args.plateau_lr else "none"
 TUNED_SOURCE_SELECTION = "target_val_eta" if args.tuned_source_val_eta else "val_loss"
 TUNED_COSINE_T_MAX = args.cos_t
 TUNED_COSINE_ETA_MIN = 1e-6
@@ -257,6 +260,8 @@ def tuned_extra_label(batch_size, typ):
     parts = [f"lr{label_value(TUNED_INITIAL_LR)}"]
     if TUNED_LR_SCHEDULER == "cosine":
         parts.append(f"cosT{default_tuned_cosine_t_max(typ)}")
+    elif TUNED_LR_SCHEDULER == "plateau":
+        parts.append("plateau")
     return "_".join(parts)
 
 

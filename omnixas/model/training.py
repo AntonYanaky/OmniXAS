@@ -87,6 +87,7 @@ class PlModule(lightning.LightningModule):
         lr_scheduler: Optional[Callable] = None,
         lr_scheduler_kwargs: Optional[Dict[str, Any]] = None,
         lr_scheduler_interval: str = "epoch",
+        lr_scheduler_frequency: int = 1,
         lr_scheduler_monitor: Optional[str] = None,
     ):
         super().__init__()
@@ -95,6 +96,7 @@ class PlModule(lightning.LightningModule):
         self.lr_scheduler = lr_scheduler
         self.lr_scheduler_kwargs = lr_scheduler_kwargs or {}
         self.lr_scheduler_interval = lr_scheduler_interval
+        self.lr_scheduler_frequency = lr_scheduler_frequency
         self.lr_scheduler_monitor = lr_scheduler_monitor
         self.loss = loss_metric()
         self.model = model
@@ -109,7 +111,7 @@ class PlModule(lightning.LightningModule):
         scheduler_config = {
             "scheduler": scheduler,
             "interval": self.lr_scheduler_interval,
-            "frequency": 1,
+            "frequency": self.lr_scheduler_frequency,
         }
         if self.lr_scheduler_monitor is not None:
             scheduler_config["monitor"] = self.lr_scheduler_monitor

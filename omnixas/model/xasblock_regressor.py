@@ -32,9 +32,12 @@ class XASBlockRegressorConfig(BaseModel):
     min_lr: float = 1e-8
     batch_size: int = 128
     use_lr_finder: bool = True
-    lr_scheduler: Literal["none", "cosine"] = "none"
+    lr_scheduler: Literal["none", "cosine", "plateau"] = "none"
     cosine_t_max: Optional[int] = None
     cosine_eta_min: float = 1e-6
+    plateau_factor: float = 0.5
+    plateau_patience: int = 5
+    plateau_min_lr: float = 1e-6
     use_early_stopping: bool = True
     monitor_metric: str = "val_loss"
     shuffle: bool = False
@@ -124,6 +127,19 @@ class XASBlockRegressor:
                     "eta_min": self.cfg.cosine_eta_min,
                 },
                 lr_scheduler_interval="epoch",
+            )
+        elif self.cfg.lr_scheduler == "plateau":
+            kwargs.update(
+                lr_scheduler=torch.optim.lr_scheduler.ReduceLROnPlateau,
+                lr_scheduler_kwargs={
+                    "mode": "min",
+                    "factor": self.cfg.plateau_factor,
+                    "patience": self.cfg.plateau_patience,
+                    "min_lr": self.cfg.plateau_min_lr,
+                },
+                lr_scheduler_interval="epoch",
+                lr_scheduler_frequency=2,
+                lr_scheduler_monitor=self.cfg.monitor_metric,
             )
         return kwargs
 
