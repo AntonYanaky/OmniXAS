@@ -347,15 +347,22 @@ def predict_with_checkpoint(ckpt, split):
     model.load("best")
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     module = model.model.to(device).eval()
+    X = np.asarray(split.val.X, dtype=np.float32)
+    preds = []
     with torch.no_grad():
-        X = torch.tensor(split.val.X, dtype=torch.float32, device=device)
-        return module(X).detach().cpu().numpy()
+        for start in range(0, len(X), 1024):
+            xb = torch.tensor(X[start : start + 1024], dtype=torch.float32, device=device)
+            preds.append(module(xb).detach().cpu().numpy())
+    return np.concatenate(preds, axis=0).astype(np.float32, copy=False)
 
 
 def val_eta_for_checkpoint(ckpt, split):
-    pred = predict_with_checkpoint(ckpt, split)
-    target = split.val.y
-    baseline = np.repeat(split.train.y.mean(axis=0, keepdims=True), len(target), axis=0)
+    pred = np.asarray(predict_with_checkpoint(ckpt, split), dtype=np.float32)
+    target = np.asarray(split.val.y, dtype=np.float32)
+    train_y = np.asarray(split.train.y, dtype=np.float32)
+    if pred.shape != target.shape:
+        raise ValueError(f"Prediction shape {pred.shape} does not match target shape {target.shape} for {ckpt}")
+    baseline = np.repeat(train_y.mean(axis=0, keepdims=True), len(target), axis=0)
     baseline_median = float(np.median(np.mean((target - baseline) ** 2, axis=1)))
     median_mse = float(np.median(np.mean((target - pred) ** 2, axis=1)))
     return baseline_median / median_mse
