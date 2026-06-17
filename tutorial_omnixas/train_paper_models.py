@@ -20,7 +20,11 @@ Examples:
 
 import argparse
 import os
+import platform
 import random
+import socket
+import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -150,6 +154,116 @@ def save_dir(root, seed, dropout=None, extra=None):
     return path
 
 
+def git_value(*args):
+    try:
+        return subprocess.check_output(["git", *args], cwd=ROOT, text=True, stderr=subprocess.DEVNULL).strip()
+    except Exception:
+        return "unavailable"
+
+
+def git_dirty():
+    status = git_value("status", "--porcelain")
+    return "unavailable" if status == "unavailable" else bool(status)
+
+
+def write_run_settings(run_dir, *, model_family, element, typ, seed, dropout, split, hidden_dims, model, source_info=None):
+    cfg = model.cfg
+    scheduler_min_lr = "none"
+    if cfg.lr_scheduler == "cosine":
+        scheduler_min_lr = cfg.cosine_eta_min
+    elif cfg.lr_scheduler == "plateau":
+        scheduler_min_lr = cfg.plateau_min_lr
+
+    sections = {
+        "Run": {
+            "model_family": model_family,
+            "element": element,
+            "spectrum_type": typ,
+            "dataset": f"{element}_{typ}",
+            "run_dir": run_dir,
+            "script": Path(__file__).as_posix(),
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+        },
+        "Hardware / Seed": {
+            "seed": seed,
+            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", "not set"),
+            "torch_cuda_available": torch.cuda.is_available(),
+            "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "none",
+        },
+        "Data": {
+            "train_size": len(split.train.X),
+            "val_size": len(split.val.X),
+            "test_size": len(split.test.X),
+            "input_dim": INPUT_DIM,
+            "output_dim": OUTPUT_DIM,
+        },
+        "Architecture": {
+            "hidden_dims": list(hidden_dims),
+            "activation": "SiLU",
+            "normalization": "BatchNorm1d",
+            "dropout": dropout,
+            "output_activation": "Softplus",
+        },
+        "Training": {
+            "batch_size": cfg.batch_size,
+            "max_epochs": cfg.max_epochs,
+            "shuffle": cfg.shuffle,
+            "monitor_metric": cfg.monitor_metric,
+            "early_stopping_enabled": cfg.use_early_stopping,
+            "early_stopping_patience": cfg.early_stopping_patience,
+            "use_lr_finder": cfg.use_lr_finder,
+        },
+        "Optimizer": {
+            "optimizer": getattr(model.model.optimizer, "__name__", str(model.model.optimizer)),
+            "starting_learning_rate": cfg.initial_lr,
+            "lr_finder_min_lr": cfg.min_lr,
+        },
+        "LR Scheduler": {
+            "scheduler": cfg.lr_scheduler,
+            "scheduler_min_lr": scheduler_min_lr,
+            "cosine_t_max": cfg.cosine_t_max if cfg.lr_scheduler == "cosine" else "none",
+            "plateau_factor": cfg.plateau_factor if cfg.lr_scheduler == "plateau" else "none",
+            "plateau_patience": cfg.plateau_patience if cfg.lr_scheduler == "plateau" else "none",
+            "plateau_monitor": cfg.monitor_metric if cfg.lr_scheduler == "plateau" else "none",
+        },
+        "Transfer Options": {
+            "freeze_first_k_layers": TUNED_FREEZE_FIRST_K if model_family == "tunedUniversalXAS" else "none",
+            "reset_final_layer": TUNED_RESET_FINAL_LAYER if model_family == "tunedUniversalXAS" else "none",
+            "reset_batchnorm": TUNED_RESET_BN if model_family == "tunedUniversalXAS" else "none",
+        },
+        "Checkpointing": {
+            "checkpoint_monitor": cfg.monitor_metric,
+            "checkpoint_mode": "min",
+            "save_top_k": 1,
+            "save_last": True,
+        },
+        "Reproducibility": {
+            "command": " ".join([sys.executable, *sys.argv]),
+            "git_commit": git_value("rev-parse", "--short", "HEAD"),
+            "git_branch": git_value("branch", "--show-current"),
+            "git_dirty": git_dirty(),
+            "python_version": platform.python_version(),
+            "torch_version": torch.__version__,
+            "hostname": socket.gethostname(),
+            "working_directory": Path.cwd(),
+        },
+    }
+    if source_info is not None:
+        reordered = {}
+        for title, values in sections.items():
+            reordered[title] = values
+            if title == "LR Scheduler":
+                reordered["Fine-tuning Source"] = source_info
+        sections = reordered
+
+    lines = ["OmniXAS Run Settings", "====================", ""]
+    for title, values in sections.items():
+        lines.extend([title, "-" * len(title)])
+        lines.extend(f"{key}: {value}" for key, value in values.items())
+        lines.append("")
+    (Path(run_dir) / "run_settings.txt").write_text("\n".join(lines), encoding="utf-8")
+
+
 def reg(
     directory,
     dims,
@@ -210,13 +324,23 @@ def checkpoint_val_loss(ckpt_path):
     return float(match.group(1)) if match else float("inf")
 
 
-def best_universal_source_by_val_loss(label):
+def best_universal_source_by_val_loss(label, split):
     ckpts = sorted(run_root("universal").glob("paper_*/best*.ckpt"))
     if not ckpts:
         raise FileNotFoundError("No UniversalXAS checkpoints found. Train UniversalXAS first.")
     best_ckpt = min(ckpts, key=checkpoint_val_loss)
-    print(f"Best UniversalXAS source for {label}: universal_val_loss={checkpoint_val_loss(best_ckpt):.8g} | {best_ckpt}", flush=True)
-    return best_ckpt.parent
+    source_info = {
+        "universal_source_selection": "val_loss",
+        "universal_source_val_loss": checkpoint_val_loss(best_ckpt),
+        "universal_source_target_val_eta": val_eta_for_checkpoint(best_ckpt, split),
+    }
+    print(
+        f"Best UniversalXAS source for {label}: "
+        f"universal_val_loss={source_info['universal_source_val_loss']:.8g}, "
+        f"target_val_eta={source_info['universal_source_target_val_eta']:.6f} | {best_ckpt}",
+        flush=True,
+    )
+    return best_ckpt.parent, source_info
 
 
 def predict_with_checkpoint(ckpt, split):
@@ -244,12 +368,17 @@ def best_universal_source_by_val_eta(label, split):
         raise FileNotFoundError("No UniversalXAS checkpoints found. Train UniversalXAS first.")
     scored = [(val_eta_for_checkpoint(ckpt, split), checkpoint_val_loss(ckpt), ckpt) for ckpt in ckpts]
     best_eta, best_val_loss, best_ckpt = max(scored, key=lambda row: row[0])
+    source_info = {
+        "universal_source_selection": "target_val_eta",
+        "universal_source_val_loss": best_val_loss,
+        "universal_source_target_val_eta": best_eta,
+    }
     print(
         f"Best UniversalXAS source for {label}: val_eta={best_eta:.6f}, "
         f"universal_val_loss={best_val_loss:.8g} | {best_ckpt}",
         flush=True,
     )
-    return best_ckpt.parent
+    return best_ckpt.parent, source_info
 
 
 def default_tuned_cosine_t_max(typ):
@@ -340,7 +469,19 @@ if "universal" in models:
         XASBlock.DROPOUT = DEFAULT_DROPOUT
         d = save_dir(run_root("universal"), seed)
         banner(job, 0, f"training UniversalXAS FEFF | seed={seed} | dir={d}")
-        reg(d, UNIVERSAL_DIMS, 32).fit(universal_split)
+        model = reg(d, UNIVERSAL_DIMS, 32)
+        write_run_settings(
+            d,
+            model_family="universalXAS",
+            element="All",
+            typ="FEFF",
+            seed=seed,
+            dropout=DEFAULT_DROPOUT,
+            split=universal_split,
+            hidden_dims=UNIVERSAL_DIMS,
+            model=model,
+        )
+        model.fit(universal_split)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -368,16 +509,28 @@ for element in elements:
                 XASBlock.DROPOUT = DEFAULT_DROPOUT
                 d = save_dir(run_root("expert", element, typ), seed)
                 banner(job, 0, f"training {element} {typ} ExpertXAS | seed={seed} | dir={d}")
-                reg(d, hparams["widths"], hparams["batch_size"]).fit(data)
+                model = reg(d, hparams["widths"], hparams["batch_size"])
+                write_run_settings(
+                    d,
+                    model_family="expertXAS",
+                    element=element,
+                    typ=typ,
+                    seed=seed,
+                    dropout=DEFAULT_DROPOUT,
+                    split=data,
+                    hidden_dims=hparams["widths"],
+                    model=model,
+                )
+                model.fit(data)
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
         if "tuned" in models:
             label = f"{element} {typ} Tuned-UniversalXAS"
-            source = (
+            source, source_info = (
                 best_universal_source_by_val_eta(label, data)
                 if TUNED_SOURCE_SELECTION == "target_val_eta"
-                else best_universal_source_by_val_loss(label)
+                else best_universal_source_by_val_loss(label, data)
             )
             for seed in seeds:
                 for dropout in TUNED_DROPOUTS:
@@ -417,6 +570,18 @@ for element in elements:
                     model.load("best")
                     apply_tuned_transfer_options(model.model)
                     model.cfg.directory = str(d)
+                    write_run_settings(
+                        d,
+                        model_family="tunedUniversalXAS",
+                        element=element,
+                        typ=typ,
+                        seed=seed,
+                        dropout=dropout,
+                        split=data,
+                        hidden_dims=UNIVERSAL_DIMS,
+                        model=model,
+                        source_info=source_info,
+                    )
                     model.fit(data)
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
