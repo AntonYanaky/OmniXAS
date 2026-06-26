@@ -53,6 +53,13 @@ p.add_argument("--tuned-monitor", choices=["val_loss", "val_median_mse"], defaul
 p.add_argument("--tuned-cosine-lr", "--cos-lr", action="store_true", dest="tuned_cosine_lr", help="Use CosineAnnealingLR for tuned fine-tuning. Defaults: T_max=250 for FEFF, 600 for VASP; eta_min=1e-6.")
 p.add_argument("--cos-t", type=int, default=None, help="Override tuned CosineAnnealingLR T_max.")
 p.add_argument("--plateau-lr", action="store_true", help="Use ReduceLROnPlateau for tuned fine-tuning.")
+p.add_argument("--warmup-cosine-lr", action="store_true", help="Use LinearLR warmup followed by CosineAnnealingLR for tuned fine-tuning.")
+p.add_argument("--warmup-epochs", type=int, default=10, help="Warmup epochs for --warmup-cosine-lr.")
+p.add_argument("--warmup-start-factor", type=float, default=0.1, help="Starting LR factor for warmup, e.g. 0.1 starts at 10%% of --tuned-lr.")
+p.add_argument("--onecycle-lr", action="store_true", help="Use OneCycleLR for tuned fine-tuning. --tuned-lr is used as max_lr.")
+p.add_argument("--onecycle-pct-start", type=float, default=0.3, help="Fraction of OneCycle steps spent increasing LR.")
+p.add_argument("--onecycle-div-factor", type=float, default=25.0, help="OneCycle initial LR divisor: initial_lr=max_lr/div_factor.")
+p.add_argument("--onecycle-final-div-factor", type=float, default=1000.0, help="OneCycle final LR divisor after div_factor.")
 p.add_argument("--tuned-source-val-eta", action="store_true", help="Select the UniversalXAS source by target validation eta instead of universal validation loss.")
 args = p.parse_args()
 
@@ -60,8 +67,17 @@ if args.gpu is not None:
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
 if args.n_runs < 1:
     raise ValueError("--n-runs must be >= 1")
-if args.tuned_cosine_lr and args.plateau_lr:
-    raise ValueError("Use only one LR scheduler: --cos-lr or --plateau-lr")
+selected_lr_schedulers = [
+    args.tuned_cosine_lr,
+    args.plateau_lr,
+    args.warmup_cosine_lr,
+    args.onecycle_lr,
+]
+if sum(bool(x) for x in selected_lr_schedulers) > 1:
+    raise ValueError(
+        "Use only one LR scheduler: --cos-lr, --plateau-lr, "
+        "--warmup-cosine-lr, or --onecycle-lr"
+    )
 
 import numpy as np
 import torch
@@ -111,10 +127,21 @@ TUNED_FREEZE_FIRST_K = args.tuned_freeze_first_k
 TUNED_RESET_FINAL_LAYER = args.tuned_reset_final_layer
 TUNED_RESET_BN = args.tuned_reset_bn
 TUNED_MONITOR = args.tuned_monitor
-TUNED_LR_SCHEDULER = "cosine" if args.tuned_cosine_lr else "plateau" if args.plateau_lr else "none"
+TUNED_LR_SCHEDULER = (
+    "warmup_cosine" if args.warmup_cosine_lr
+    else "onecycle" if args.onecycle_lr
+    else "cosine" if args.tuned_cosine_lr
+    else "plateau" if args.plateau_lr
+    else "none"
+)
 TUNED_SOURCE_SELECTION = "target_val_eta" if args.tuned_source_val_eta else "val_loss"
 TUNED_COSINE_T_MAX = args.cos_t
 TUNED_COSINE_ETA_MIN = 1e-6
+TUNED_WARMUP_EPOCHS = args.warmup_epochs
+TUNED_WARMUP_START_FACTOR = args.warmup_start_factor
+TUNED_ONECYCLE_PCT_START = args.onecycle_pct_start
+TUNED_ONECYCLE_DIV_FACTOR = args.onecycle_div_factor
+TUNED_ONECYCLE_FINAL_DIV_FACTOR = args.onecycle_final_div_factor
 MIN_LR = 1e-4
 
 
@@ -169,7 +196,7 @@ def git_dirty():
 def write_run_settings(run_dir, *, model_family, element, typ, seed, dropout, split, hidden_dims, model, source_info=None):
     cfg = model.cfg
     scheduler_min_lr = "none"
-    if cfg.lr_scheduler == "cosine":
+    if cfg.lr_scheduler in ("cosine", "warmup_cosine"):
         scheduler_min_lr = cfg.cosine_eta_min
     elif cfg.lr_scheduler == "plateau":
         scheduler_min_lr = cfg.plateau_min_lr
@@ -221,10 +248,16 @@ def write_run_settings(run_dir, *, model_family, element, typ, seed, dropout, sp
         "LR Scheduler": {
             "scheduler": cfg.lr_scheduler,
             "scheduler_min_lr": scheduler_min_lr,
-            "cosine_t_max": cfg.cosine_t_max if cfg.lr_scheduler == "cosine" else "none",
+            "cosine_t_max": cfg.cosine_t_max if cfg.lr_scheduler in ("cosine", "warmup_cosine") else "none",
             "plateau_factor": cfg.plateau_factor if cfg.lr_scheduler == "plateau" else "none",
             "plateau_patience": cfg.plateau_patience if cfg.lr_scheduler == "plateau" else "none",
             "plateau_monitor": cfg.monitor_metric if cfg.lr_scheduler == "plateau" else "none",
+            "warmup_epochs": cfg.warmup_epochs if cfg.lr_scheduler == "warmup_cosine" else "none",
+            "warmup_start_factor": cfg.warmup_start_factor if cfg.lr_scheduler == "warmup_cosine" else "none",
+            "onecycle_max_lr": (cfg.onecycle_max_lr or cfg.initial_lr) if cfg.lr_scheduler == "onecycle" else "none",
+            "onecycle_pct_start": cfg.onecycle_pct_start if cfg.lr_scheduler == "onecycle" else "none",
+            "onecycle_div_factor": cfg.onecycle_div_factor if cfg.lr_scheduler == "onecycle" else "none",
+            "onecycle_final_div_factor": cfg.onecycle_final_div_factor if cfg.lr_scheduler == "onecycle" else "none",
         },
         "Transfer Options": {
             "freeze_first_k_layers": TUNED_FREEZE_FIRST_K if model_family == "tunedUniversalXAS" else "none",
@@ -279,6 +312,11 @@ def reg(
     lr_scheduler="none",
     cosine_t_max=None,
     cosine_eta_min=1e-6,
+    warmup_epochs=TUNED_WARMUP_EPOCHS,
+    warmup_start_factor=TUNED_WARMUP_START_FACTOR,
+    onecycle_pct_start=TUNED_ONECYCLE_PCT_START,
+    onecycle_div_factor=TUNED_ONECYCLE_DIV_FACTOR,
+    onecycle_final_div_factor=TUNED_ONECYCLE_FINAL_DIV_FACTOR,
 ):
     return XASBlockRegressor(
         directory=str(directory),
@@ -298,6 +336,11 @@ def reg(
         lr_scheduler=lr_scheduler,
         cosine_t_max=cosine_t_max,
         cosine_eta_min=cosine_eta_min,
+        warmup_epochs=warmup_epochs,
+        warmup_start_factor=warmup_start_factor,
+        onecycle_pct_start=onecycle_pct_start,
+        onecycle_div_factor=onecycle_div_factor,
+        onecycle_final_div_factor=onecycle_final_div_factor,
     )
 
 
@@ -395,6 +438,11 @@ def tuned_extra_label(batch_size, typ):
     parts = [f"lr{label_value(TUNED_INITIAL_LR)}"]
     if TUNED_LR_SCHEDULER == "cosine":
         parts.append(f"cosT{default_tuned_cosine_t_max(typ)}")
+    elif TUNED_LR_SCHEDULER == "warmup_cosine":
+        parts.append(f"warmcosT{default_tuned_cosine_t_max(typ)}")
+        parts.append(f"warm{TUNED_WARMUP_EPOCHS}")
+    elif TUNED_LR_SCHEDULER == "onecycle":
+        parts.append("onecycle")
     elif TUNED_LR_SCHEDULER == "plateau":
         parts.append("plateau")
     return "_".join(parts)
@@ -450,6 +498,11 @@ print(f"Tuned early stopping: {TUNED_USE_EARLY_STOPPING} | patience={TUNED_PATIE
 print(f"Tuned monitor metric: {TUNED_MONITOR}", flush=True)
 print(f"Tuned LR scheduler: {TUNED_LR_SCHEDULER}", flush=True)
 print(f"Tuned cosine T_max override: {TUNED_COSINE_T_MAX}", flush=True)
+print(f"Tuned warmup epochs: {TUNED_WARMUP_EPOCHS}", flush=True)
+print(f"Tuned warmup start factor: {TUNED_WARMUP_START_FACTOR}", flush=True)
+print(f"Tuned OneCycle pct_start: {TUNED_ONECYCLE_PCT_START}", flush=True)
+print(f"Tuned OneCycle div_factor: {TUNED_ONECYCLE_DIV_FACTOR}", flush=True)
+print(f"Tuned OneCycle final_div_factor: {TUNED_ONECYCLE_FINAL_DIV_FACTOR}", flush=True)
 print(f"Tuned UniversalXAS source selection: {TUNED_SOURCE_SELECTION}", flush=True)
 print(f"Tuned batch override: {TUNED_BATCH_SIZE}", flush=True)
 print(f"Tuned fine-tune DataLoader shuffle: {TUNED_SHUFFLE}", flush=True)
@@ -546,7 +599,7 @@ for element in elements:
                     tuned_batch_size = TUNED_BATCH_SIZE or hparams["batch_size"]
                     extra = tuned_extra_label(tuned_batch_size, typ)
                     d = save_dir(run_root("tuned", element, typ), seed, dropout, extra)
-                    tuned_cosine_t_max = default_tuned_cosine_t_max(typ) if TUNED_LR_SCHEDULER == "cosine" else None
+                    tuned_cosine_t_max = default_tuned_cosine_t_max(typ) if TUNED_LR_SCHEDULER in ("cosine", "warmup_cosine") else None
                     banner(
                         job,
                         0,
@@ -555,6 +608,7 @@ for element in elements:
                         f"early_stop={TUNED_USE_EARLY_STOPPING} | patience={TUNED_PATIENCE} | "
                         f"monitor={TUNED_MONITOR} | scheduler={TUNED_LR_SCHEDULER} | "
                         f"cosine_t_max={tuned_cosine_t_max} | cosine_eta_min={TUNED_COSINE_ETA_MIN} | "
+                        f"warmup_epochs={TUNED_WARMUP_EPOCHS} | onecycle_pct_start={TUNED_ONECYCLE_PCT_START} | "
                         f"shuffle={TUNED_SHUFFLE} | freeze_first_k={TUNED_FREEZE_FIRST_K} | "
                         f"reset_final={TUNED_RESET_FINAL_LAYER} | reset_bn={TUNED_RESET_BN} | dir={d}",
                     )
@@ -572,6 +626,11 @@ for element in elements:
                         lr_scheduler=TUNED_LR_SCHEDULER,
                         cosine_t_max=tuned_cosine_t_max,
                         cosine_eta_min=TUNED_COSINE_ETA_MIN,
+                        warmup_epochs=TUNED_WARMUP_EPOCHS,
+                        warmup_start_factor=TUNED_WARMUP_START_FACTOR,
+                        onecycle_pct_start=TUNED_ONECYCLE_PCT_START,
+                        onecycle_div_factor=TUNED_ONECYCLE_DIV_FACTOR,
+                        onecycle_final_div_factor=TUNED_ONECYCLE_FINAL_DIV_FACTOR,
                     )
                     model.load("best")
                     apply_tuned_transfer_options(model.model)
