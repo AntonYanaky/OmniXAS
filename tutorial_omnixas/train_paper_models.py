@@ -37,6 +37,14 @@ p.add_argument("--seed", type=int, default=None)
 p.add_argument("--gpu", type=str, default=None)
 p.add_argument("--data-dir", type=str, default="tutorial_omnixas/ml_data", help="Directory containing *_X.txt/*_y.txt split files.")
 p.add_argument("--training-root", type=str, default="output/training", help="Root directory for model outputs.")
+p.add_argument("--universal-lr", type=float, default=None, help="UniversalXAS LR. If omitted, keeps LR finder behavior.")
+p.add_argument("--universal-dropout", type=float, default=None, help="UniversalXAS dropout. Defaults to paper value.")
+p.add_argument("--universal-max-epochs", type=int, default=None)
+p.add_argument("--universal-patience", type=int, default=None)
+p.add_argument("--universal-monitor", choices=["val_loss", "val_median_mse"], default="val_median_mse")
+p.add_argument("--universal-cos-lr", action="store_true", help="Use cosine LR for UniversalXAS.")
+p.add_argument("--universal-cos-t", type=int, default=None)
+p.add_argument("--universal-shuffle", action="store_true", help="Shuffle UniversalXAS training batches.")
 p.add_argument(
     "--tuned-lr",
     type=float,
@@ -121,6 +129,13 @@ TUNED_DROPOUTS = list(args.tuned_dropouts) if args.tuned_dropouts is not None el
 MAX_EPOCHS = 1000
 PATIENCE = 25
 INITIAL_LR = 1e-3
+UNIVERSAL_DROPOUT = DEFAULT_DROPOUT if args.universal_dropout is None else args.universal_dropout
+UNIVERSAL_INITIAL_LR = INITIAL_LR if args.universal_lr is None else args.universal_lr
+UNIVERSAL_USE_LR_FINDER = args.universal_lr is None
+UNIVERSAL_MAX_EPOCHS = MAX_EPOCHS if args.universal_max_epochs is None else args.universal_max_epochs
+UNIVERSAL_PATIENCE = PATIENCE if args.universal_patience is None else args.universal_patience
+UNIVERSAL_LR_SCHEDULER = "cosine" if args.universal_cos_lr else "none"
+UNIVERSAL_COSINE_T_MAX = args.universal_cos_t or UNIVERSAL_MAX_EPOCHS
 TUNED_INITIAL_LR = float(
     args.tuned_lr if args.tuned_lr is not None else HYDRA_TRAIN_CFG.training.lr
 )
@@ -497,6 +512,13 @@ print("Models:", models, flush=True)
 print("Elements:", elements, flush=True)
 print("Types:", types, flush=True)
 print("Seeds:", seeds, flush=True)
+print(
+    f"UniversalXAS: dropout={UNIVERSAL_DROPOUT}, lr={UNIVERSAL_INITIAL_LR}, "
+    f"lr_finder={UNIVERSAL_USE_LR_FINDER}, max_epochs={UNIVERSAL_MAX_EPOCHS}, "
+    f"patience={UNIVERSAL_PATIENCE}, monitor={args.universal_monitor}, "
+    f"scheduler={UNIVERSAL_LR_SCHEDULER}, shuffle={args.universal_shuffle}",
+    flush=True,
+)
 print(f"Tuned fine-tune LR from config/paper_hydra/train.yaml: {TUNED_INITIAL_LR}", flush=True)
 print(f"Tuned dropouts: {TUNED_DROPOUTS}", flush=True)
 print(f"Tuned max epochs: {TUNED_MAX_EPOCHS}", flush=True)
@@ -531,17 +553,30 @@ if "universal" in models:
     for seed in seeds:
         job += 1
         seed_everything(seed, workers=True)
-        XASBlock.DROPOUT = DEFAULT_DROPOUT
-        d = save_dir(run_root("universal"), seed)
+        XASBlock.DROPOUT = UNIVERSAL_DROPOUT
+        d = save_dir(run_root("universal"), seed, UNIVERSAL_DROPOUT, f"lr{label_value(UNIVERSAL_INITIAL_LR)}_{UNIVERSAL_LR_SCHEDULER}")
         banner(job, 0, f"training UniversalXAS FEFF | seed={seed} | dir={d}")
-        model = reg(d, UNIVERSAL_DIMS, 32)
+        model = reg(
+            d,
+            UNIVERSAL_DIMS,
+            32,
+            initial_lr=UNIVERSAL_INITIAL_LR,
+            use_lr_finder=UNIVERSAL_USE_LR_FINDER,
+            shuffle=args.universal_shuffle,
+            max_epochs=UNIVERSAL_MAX_EPOCHS,
+            early_stopping_patience=UNIVERSAL_PATIENCE,
+            monitor_metric=args.universal_monitor,
+            lr_scheduler=UNIVERSAL_LR_SCHEDULER,
+            cosine_t_max=UNIVERSAL_COSINE_T_MAX if UNIVERSAL_LR_SCHEDULER == "cosine" else None,
+            cosine_eta_min=TUNED_COSINE_ETA_MIN,
+        )
         write_run_settings(
             d,
             model_family="universalXAS",
             element="All",
             typ="FEFF",
             seed=seed,
-            dropout=DEFAULT_DROPOUT,
+            dropout=UNIVERSAL_DROPOUT,
             split=universal_split,
             hidden_dims=UNIVERSAL_DIMS,
             model=model,
