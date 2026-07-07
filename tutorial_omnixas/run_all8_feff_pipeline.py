@@ -193,9 +193,11 @@ def run_variant(name: str, args: argparse.Namespace, root: Path, env: dict[str, 
 
     print(f"\n=== {name}: encoder ===", flush=True)
     if not (args.resume and features.exists()):
+        # Do not log inside run_dir before the encoder starts: the encoder owns
+        # creating that directory and intentionally fails if it already exists.
         run(
             [sys.executable, "tutorial_omnixas/m3gnet_all8_feff_encoder.py", *enc_args],
-            log_path=run_dir / "encoder.log",
+            log_path=base_dir / "pipeline_logs" / f"{run_name}_encoder.log",
             env=env,
             cwd=root,
         )
