@@ -45,7 +45,6 @@ p.add_argument("--universal-monitor", choices=["val_loss", "val_median_mse"], de
 p.add_argument("--universal-cos-lr", action="store_true", help="Use cosine LR for UniversalXAS.")
 p.add_argument("--universal-cos-t", type=int, default=None)
 p.add_argument("--universal-shuffle", action="store_true", help="Shuffle UniversalXAS training batches.")
-p.add_argument("--no-progress-bar", action="store_true", help="Disable Lightning progress bars for cleaner log files.")
 p.add_argument(
     "--tuned-lr",
     type=float,
@@ -363,7 +362,6 @@ def reg(
         onecycle_pct_start=onecycle_pct_start,
         onecycle_div_factor=onecycle_div_factor,
         onecycle_final_div_factor=onecycle_final_div_factor,
-        enable_progress_bar=not args.no_progress_bar,
     )
 
 

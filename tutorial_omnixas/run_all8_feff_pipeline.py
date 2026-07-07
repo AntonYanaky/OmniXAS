@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 from datetime import datetime
@@ -67,7 +68,6 @@ UNIVERSAL_ARGS = [
     "--universal-monitor", "val_median_mse",
     "--universal-cos-lr",
     "--universal-shuffle",
-    "--no-progress-bar",
 ]
 
 
@@ -83,6 +83,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source-universal-ckpt", default=None, help="Checkpoint for frozen-Universal supervisor. Defaults to latest existing UniversalXAS.")
     parser.add_argument("--train-source-universal", action="store_true", help="Train a new source UniversalXAS instead of reusing an existing one.")
     parser.add_argument("--resume", action="store_true", help="Skip stages whose expected outputs already exist.")
+    parser.add_argument("--overwrite", action="store_true", help="Delete selected variant run directories before rerunning.")
     parser.add_argument("--smoke", action="store_true", help="Tiny run to test the pipeline wiring.")
     return parser.parse_args()
 
@@ -92,14 +93,12 @@ def run(cmd: list[str], *, log_path: Path, env: dict[str, str], cwd: Path) -> No
     print("\n$ " + " ".join(cmd), flush=True)
     with log_path.open("a", encoding="utf-8") as log:
         log.write("\n\n$ " + " ".join(cmd) + "\n")
-        proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            print(line, end="")
-            log.write(line)
-        code = proc.wait()
-    if code != 0:
-        raise SystemExit(f"Command failed with exit code {code}. See {log_path}")
+        log.write(f"cwd={cwd}\n")
+    result = subprocess.run(cmd, cwd=cwd, env=env)
+    with log_path.open("a", encoding="utf-8") as log:
+        log.write(f"exit_code={result.returncode}\n")
+    if result.returncode != 0:
+        raise SystemExit(f"Command failed with exit code {result.returncode}: {' '.join(cmd)}")
 
 
 def require_paths(root: Path) -> None:
@@ -186,6 +185,9 @@ def variant_encoder_args(name: str, args: argparse.Namespace, source_ckpt: Path 
 def run_variant(name: str, args: argparse.Namespace, root: Path, env: dict[str, str], base_dir: Path, source_ckpt: Path | None) -> None:
     run_name, enc_args = variant_encoder_args(name, args, source_ckpt)
     run_dir = base_dir / run_name
+    if args.overwrite and run_dir.exists():
+        print(f"deleting existing run: {run_dir}", flush=True)
+        shutil.rmtree(run_dir)
     features = run_dir / "features"
     eval_csv = run_dir / "universal_eval.csv"
 
@@ -240,7 +242,6 @@ def main() -> None:
 
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = args.gpu
-    env["TQDM_DISABLE"] = "1"
 
     print("plan:", " -> ".join(args.variants), flush=True)
     if any(VARIANTS[name].get("needs_source_universal") for name in args.variants):
