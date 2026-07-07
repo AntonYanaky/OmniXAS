@@ -165,8 +165,16 @@ class FEFFDataset(Dataset):
             anchor = np.atleast_2d(np.loadtxt(data_dir / f"{task}_{split}_X.txt", dtype=np.float32)) / FEATURE_SCALE
             if max_per_task is not None:
                 ids, y, anchor = ids[:max_per_task], y[:max_per_task], anchor[:max_per_task]
+            if len(ids) != len(y) or len(ids) != len(anchor):
+                raise ValueError(f"Split length mismatch for {task} {split}: ids={len(ids)} y={len(y)} X={len(anchor)}")
             for (mid, site), yi, ai in zip(ids, y, anchor, strict=True):
-                self.rows.append((task, mid, site, torch.tensor(yi), torch.tensor(ai)))
+                self.rows.append((
+                    task,
+                    mid,
+                    site,
+                    torch.as_tensor(yi, dtype=torch.float32),
+                    torch.as_tensor(ai, dtype=torch.float32),
+                ))
 
     def __len__(self) -> int:
         return len(self.rows)
