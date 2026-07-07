@@ -35,6 +35,8 @@ p.add_argument("--types", nargs="+", default=["FEFF"], choices=["all", "FEFF", "
 p.add_argument("--n-runs", type=int, default=1)
 p.add_argument("--seed", type=int, default=None)
 p.add_argument("--gpu", type=str, default=None)
+p.add_argument("--data-dir", type=str, default="tutorial_omnixas/ml_data", help="Directory containing *_X.txt/*_y.txt split files.")
+p.add_argument("--training-root", type=str, default="output/training", help="Root directory for model outputs.")
 p.add_argument(
     "--tuned-lr",
     type=float,
@@ -89,8 +91,12 @@ from omnixas.model.xasblock import XASBlock
 from omnixas.model.xasblock_regressor import XASBlockRegressor
 
 ROOT = Path(__file__).resolve().parents[1]
-DATA = ROOT / "tutorial_omnixas" / "ml_data"
-OUT = ROOT / "output" / "training"
+DATA = Path(args.data_dir)
+if not DATA.is_absolute():
+    DATA = ROOT / DATA
+OUT = Path(args.training_root)
+if not OUT.is_absolute():
+    OUT = ROOT / OUT
 HYDRA_TRAIN_CFG = OmegaConf.load(ROOT / "config" / "paper_hydra" / "train.yaml")
 
 INPUT_DIM, OUTPUT_DIM = 64, 141

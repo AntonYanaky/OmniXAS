@@ -243,3 +243,8 @@ poetry.toml
 pyrightconfig.json
 
 # End of https://www.toptal.com/developers/gitignore/api/macos,linux,jupyternotebooks,python
+
+# Local/generated OmniXAS experiment data
+tutorial_omnixas/ml_data_m3gnet_depth_cu_feff/
+# Local scratch files
+tmp/
