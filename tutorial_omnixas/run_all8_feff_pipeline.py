@@ -67,6 +67,7 @@ UNIVERSAL_ARGS = [
     "--universal-monitor", "val_median_mse",
     "--universal-cos-lr",
     "--universal-shuffle",
+    "--no-progress-bar",
 ]
 
 
@@ -79,7 +80,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--accelerator", default="gpu")
     parser.add_argument("--deriv-lambda", default="0.02")
     parser.add_argument("--base-dir", default="output/training/m3gnetAll8FEFF")
-    parser.add_argument("--source-universal-ckpt", default=None)
+    parser.add_argument("--source-universal-ckpt", default=None, help="Checkpoint for frozen-Universal supervisor. Defaults to latest existing UniversalXAS.")
+    parser.add_argument("--train-source-universal", action="store_true", help="Train a new source UniversalXAS instead of reusing an existing one.")
     parser.add_argument("--resume", action="store_true", help="Skip stages whose expected outputs already exist.")
     parser.add_argument("--smoke", action="store_true", help="Tiny run to test the pipeline wiring.")
     return parser.parse_args()
@@ -111,17 +113,15 @@ def require_paths(root: Path) -> None:
         raise SystemExit("Missing models/M3GNet-MP-2021.2.8-PES")
 
 
-def best_universal_ckpt(source_root: Path) -> Path:
-    ckpts = sorted(
-        (source_root / "universalXAS" / "All_FEFF" / "runs").glob("*/best*.ckpt"),
-        key=lambda p: p.stat().st_mtime,
-    )
-    if not ckpts:
-        raise SystemExit(f"No UniversalXAS checkpoint under {source_root}")
-    return ckpts[-1]
+def latest_universal_ckpt(root: Path, training_root: Path) -> Path | None:
+    ckpts = []
+    for base in [training_root, root / "output" / "training"]:
+        ckpts += list((base / "universalXAS" / "All_FEFF" / "runs").glob("*/best*.ckpt"))
+        ckpts += list((base / "universalXAS" / "All_FEFF" / "checkpoints").glob("best*.ckpt"))
+    return sorted(set(ckpts), key=lambda p: p.stat().st_mtime)[-1] if ckpts else None
 
 
-def train_source_universal(args: argparse.Namespace, root: Path, env: dict[str, str], base_dir: Path) -> Path:
+def source_universal_ckpt(args: argparse.Namespace, root: Path, env: dict[str, str], base_dir: Path) -> Path:
     if args.source_universal_ckpt:
         ckpt = Path(args.source_universal_ckpt)
         if not ckpt.exists():
@@ -129,9 +129,11 @@ def train_source_universal(args: argparse.Namespace, root: Path, env: dict[str, 
         return ckpt
 
     source_root = base_dir / "source_universal"
-    expected = list((source_root / "universalXAS" / "All_FEFF" / "runs").glob("*/best*.ckpt"))
-    if args.resume and expected:
-        return best_universal_ckpt(source_root)
+    if not args.train_source_universal:
+        ckpt = latest_universal_ckpt(root, source_root)
+        if ckpt is not None:
+            return ckpt
+        raise SystemExit("No existing UniversalXAS checkpoint found. Run with --train-source-universal or pass --source-universal-ckpt.")
 
     run(
         [
@@ -145,7 +147,10 @@ def train_source_universal(args: argparse.Namespace, root: Path, env: dict[str, 
         env=env,
         cwd=root,
     )
-    return best_universal_ckpt(source_root)
+    ckpt = latest_universal_ckpt(root, source_root)
+    if ckpt is None:
+        raise SystemExit(f"No UniversalXAS checkpoint created under {source_root}")
+    return ckpt
 
 
 def variant_encoder_args(name: str, args: argparse.Namespace, source_ckpt: Path | None) -> tuple[str, list[str]]:
@@ -235,11 +240,16 @@ def main() -> None:
 
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = args.gpu
+    env["TQDM_DISABLE"] = "1"
+
+    print("plan:", " -> ".join(args.variants), flush=True)
+    if any(VARIANTS[name].get("needs_source_universal") for name in args.variants):
+        print("note: pretrained_frozen_universal reuses an existing UniversalXAS checkpoint unless --train-source-universal is set.", flush=True)
 
     source_ckpt = None
     if any(VARIANTS[name].get("needs_source_universal") for name in args.variants):
         print("=== source UniversalXAS ===", flush=True)
-        source_ckpt = train_source_universal(args, root, env, base_dir)
+        source_ckpt = source_universal_ckpt(args, root, env, base_dir)
         print(f"source checkpoint: {source_ckpt}", flush=True)
 
     print("started:", datetime.now().isoformat(timespec="seconds"), flush=True)

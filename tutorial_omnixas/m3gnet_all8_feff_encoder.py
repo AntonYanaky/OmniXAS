@@ -652,6 +652,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--export-dir", default=None, help="Default: <run_dir>/features")
     parser.add_argument("--skip-train", action="store_true", help="Only export from --checkpoint.")
     parser.add_argument("--checkpoint", default=None, help="Checkpoint to export when --skip-train, or explicit checkpoint after training.")
+    parser.add_argument("--progress-bar", action="store_true", help="Enable Lightning progress bars. Off by default for clean logs.")
     return parser.parse_args()
 
 
@@ -758,6 +759,7 @@ def main() -> None:
             callbacks=[EarlyStopping(monitor=args.monitor, patience=args.patience, mode=mode), checkpoint],
             logger=CSVLogger(save_dir=str(run_dir), name="logs"),
             log_every_n_steps=1,
+            enable_progress_bar=args.progress_bar,
         )
         trainer.fit(lit, train_loader, val_loader)
         if not checkpoint.best_model_path:
