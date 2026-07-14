@@ -13,6 +13,12 @@ import shutil
 from datetime import datetime
 from pathlib import Path
 
+_gpu_parser = argparse.ArgumentParser(add_help=False)
+_gpu_parser.add_argument("--gpu", default=None)
+_gpu_args, _ = _gpu_parser.parse_known_args()
+if _gpu_args.gpu is not None:
+    os.environ["CUDA_VISIBLE_DEVICES"] = _gpu_args.gpu
+
 import dgl
 import lightning.pytorch as pl
 import numpy as np
@@ -395,6 +401,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--run-name", default=None)
     p.add_argument("--output-root", default="output/training/m3gnetAll8FEFF")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--gpu", default=None, help="GPU id to expose, e.g. 0 or 1. Equivalent to CUDA_VISIBLE_DEVICES.")
     p.add_argument("--overwrite", action="store_true")
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--encoder-lr", type=float, default=1e-3)
