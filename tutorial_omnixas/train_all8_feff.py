@@ -153,7 +153,10 @@ def load_structure(raw_root: Path, task: str, material_id: str, site: int) -> St
     element, kind = task.split("_", 1)
     material_dir = raw_root / kind / element / material_id
     if kind == "VASP":
-        return Structure.from_file(material_dir / "VASP" / f"{site:03d}_{element}" / "POSCAR")
+        structure = Structure.from_file(material_dir / "VASP" / f"{site:03d}_{element}" / "POSCAR")
+        if structure[0].specie.symbol != element:
+            raise ValueError(f"VASP absorber is not first in {material_id} site {site}: {structure[0].specie}")
+        return structure
     poscar = material_dir / "POSCAR"
     if poscar.exists():
         return Structure.from_file(poscar)
@@ -179,10 +182,11 @@ class FEFFDataset(Dataset):
 
     def __getitem__(self, idx):
         task, mid, site, y = self.rows[idx]
-        key = (task, mid)
+        is_vasp = task.endswith("_VASP")
+        key = (task, mid, site) if is_vasp else (task, mid)
         if key not in self.cache:
             self.cache[key] = load_structure(self.raw_root, task, mid, site)
-        return task, self.cache[key], site, y
+        return task, self.cache[key], 0 if is_vasp else site, y
 
 
 class CollateGraphs:
