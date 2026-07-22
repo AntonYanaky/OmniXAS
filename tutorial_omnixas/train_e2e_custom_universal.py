@@ -7,9 +7,9 @@ Resume:
     python tutorial_omnixas/train_e2e_custom_universal.py --run-name e2e_universal_seed42 --gpu 0 --resume
 
 Pipeline:
-1. Train scratch M3GNet-style encoder + full UniversalXAS head on all FEFF data.
+1. Train scratch M3GNet-style encoder + one UniversalXAS head on FEFF+VASP.
 2. Export frozen encoder features for all FEFF and VASP tasks.
-3. Continue training the same UniversalXAS head on exported all-FEFF features.
+3. Continue training the same UniversalXAS head on exported FEFF+VASP features.
 4. Fine-tune that continued UniversalXAS on each FEFF/VASP dataset with a small
    validation-selected sweep.
 """
@@ -50,7 +50,6 @@ from train_all8_feff import (
     ENCODER_PATIENCE,
     EXPORT_TASKS,
     FEATURE_SCALE,
-    FEFF_TASKS,
     HEAD_WIDTHS,
     INPUT_DIM,
     OUTPUT_DIM,
@@ -86,6 +85,7 @@ class LitEndToEnd(pl.LightningModule):
     def __init__(
         self,
         model: EndToEndUniversal,
+        tasks: list[str],
         train_base: torch.Tensor,
         val_base: torch.Tensor,
         task_weights: torch.Tensor,
@@ -96,6 +96,7 @@ class LitEndToEnd(pl.LightningModule):
     ):
         super().__init__()
         self.model = model
+        self.tasks = tasks
         self.encoder_lr = encoder_lr
         self.head_lr = head_lr
         self.weight_decay = weight_decay
@@ -139,7 +140,7 @@ class LitEndToEnd(pl.LightningModule):
         mses = torch.cat(self.val_mses)
         tasks = torch.cat(self.val_tasks)
         rel_medians = []
-        for idx, task_name in enumerate(FEFF_TASKS):
+        for idx, task_name in enumerate(self.tasks):
             mask = tasks == idx
             if not mask.any():
                 continue
@@ -194,10 +195,10 @@ def json_ready(args: argparse.Namespace, run: Path) -> dict[str, Any]:
     return vars(args) | {"run_dir": str(run), "pipeline": "e2e_custom_encoder_universal"}
 
 
-def task_baselines(root: Path) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def task_baselines(root: Path, tasks: list[str]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     data = root / "tutorial_omnixas" / "ml_data"
     train_base, val_base, counts = [], [], []
-    for task in FEFF_TASKS:
+    for task in tasks:
         train_y = np.atleast_2d(np.loadtxt(data / f"{task}_train_y.txt", dtype=np.float32))
         counts.append(len(train_y))
         for split_name, out in (("train", train_base), ("val", val_base)):
@@ -205,7 +206,7 @@ def task_baselines(root: Path) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor
             baseline = np.repeat(train_y.mean(axis=0, keepdims=True), len(y), axis=0)
             out.append(float(np.median(np.mean((y - baseline) ** 2, axis=1))))
     counts_t = torch.tensor(counts, dtype=torch.float32)
-    weights = counts_t.sum() / (len(FEFF_TASKS) * counts_t)
+    weights = counts_t.sum() / (len(tasks) * counts_t)
     return torch.tensor(train_base), torch.tensor(val_base), weights
 
 
@@ -307,7 +308,7 @@ def export_features(run: Path, e2e_ckpt: Path, root: Path, raw_root: Path, args:
 
 
 def universal_split(features: Path) -> MLSplits:
-    splits = [load_feature_split(features, task) for task in FEFF_TASKS]
+    splits = [load_feature_split(features, task) for task in EXPORT_TASKS]
     return MLSplits(
         train=MLData(X=np.concatenate([s.train.X for s in splits]), y=np.concatenate([s.train.y for s in splits])),
         val=MLData(X=np.concatenate([s.val.X for s in splits]), y=np.concatenate([s.val.y for s in splits])),
@@ -341,12 +342,13 @@ def train_e2e(run: Path, root: Path, raw_root: Path, args: argparse.Namespace) -
         print(f"reusing end-to-end checkpoint: {copied}", flush=True)
         return copied
 
-    train_base, val_base, weights = task_baselines(root)
+    tasks = list(EXPORT_TASKS)
+    train_base, val_base, weights = task_baselines(root, tasks)
     model = EndToEndUniversal(args.gnn_dropout, args.e2e_head_dropout)
     collate = CollateGraphs(model.encoder)
-    train_loader = DataLoader(FEFFDataset(root, raw_root, FEFF_TASKS, "train"), batch_size=ENCODER_BATCH, shuffle=True, collate_fn=collate, num_workers=args.num_workers, drop_last=True)
-    val_loader = DataLoader(FEFFDataset(root, raw_root, FEFF_TASKS, "val"), batch_size=ENCODER_BATCH, shuffle=False, collate_fn=collate, num_workers=args.num_workers)
-    lit = LitEndToEnd(model, train_base, val_base, weights, args.e2e_encoder_lr, args.e2e_head_lr, args.weight_decay, args.e2e_epochs)
+    train_loader = DataLoader(FEFFDataset(root, raw_root, tasks, "train"), batch_size=ENCODER_BATCH, shuffle=True, collate_fn=collate, num_workers=args.num_workers, drop_last=True)
+    val_loader = DataLoader(FEFFDataset(root, raw_root, tasks, "val"), batch_size=ENCODER_BATCH, shuffle=False, collate_fn=collate, num_workers=args.num_workers)
+    lit = LitEndToEnd(model, tasks, train_base, val_base, weights, args.e2e_encoder_lr, args.e2e_head_lr, args.weight_decay, args.e2e_epochs)
     ckpt = ModelCheckpoint(dirpath=run / "checkpoints", filename="best-{epoch:03d}-{val_balanced_rel_mse:.5f}", monitor="val_balanced_rel_mse", mode="min", save_top_k=1, save_last=True)
     pl.Trainer(
         max_epochs=args.e2e_epochs,
@@ -363,7 +365,7 @@ def train_e2e(run: Path, root: Path, raw_root: Path, args: argparse.Namespace) -
 
 
 def continue_universal(run: Path, e2e_ckpt: Path, features: Path, args: argparse.Namespace) -> Path:
-    out = run / "heads" / "universalXAS" / "All_FEFF" / "runs" / f"continued_seed{args.seed}_lr{args.universal_lr}_dropout{args.universal_dropout}"
+    out = run / "heads" / "universalXAS" / "All_FEFF_VASP" / "runs" / f"continued_seed{args.seed}_lr{args.universal_lr}_dropout{args.universal_dropout}"
     ckpt = best_checkpoint(out)
     if ckpt is not None:
         print(f"reusing continued UniversalXAS checkpoint: {ckpt}", flush=True)
