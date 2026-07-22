@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train scratch all-8 FEFF encoder, UniversalXAS, and tuned UniversalXAS."""
+"""Train/resume scratch all-8 FEFF encoder, feature export, UniversalXAS, and tuned heads."""
 
 from __future__ import annotations
 
@@ -377,11 +377,16 @@ def checkpoint_score(ckpt: Path) -> float:
     for name, state in torch_load(ckpt).get("callbacks", {}).items():
         if "ModelCheckpoint" in str(name) and state.get("best_model_score") is not None:
             score = state["best_model_score"]
-            scores.append(float(score.detach().cpu().item() if torch.is_tensor(score) else score))
+            value = float(score.detach().cpu().item() if torch.is_tensor(score) else score)
+            if np.isfinite(value):
+                scores.append(value)
     if scores:
         return min(scores)
-    match = re.search(r"val_(?:loss|median_mse)[=_](\d+(?:\.\d+)?)", ckpt.name)
-    return float(match.group(1)) if match else float("inf")
+    match = re.search(r"val_(?:loss|median_mse|balanced_rel_mse)[=_](nan|\d+(?:\.\d+)?)", ckpt.name)
+    if not match:
+        return float("inf")
+    value = float(match.group(1))
+    return value if np.isfinite(value) else float("inf")
 
 
 def eval_ckpt(ckpt: Path, split: MLSplits, split_name: str) -> dict[str, float]:
@@ -400,6 +405,61 @@ def eval_ckpt(ckpt: Path, split: MLSplits, split_name: str) -> dict[str, float]:
     return {f"{split_name}_median_mse": median_mse, f"{split_name}_baseline_median_mse": baseline_mse, f"{split_name}_eta": baseline_mse / median_mse}
 
 
+def best_head_checkpoint(directory: Path) -> Path | None:
+    if not directory.exists():
+        return None
+    checkpoints = sorted(directory.glob("best*.ckpt"))
+    if not checkpoints:
+        return None
+    return min(checkpoints, key=checkpoint_score)
+
+
+def ensure_no_incomplete_head(directory: Path, label: str) -> None:
+    checkpoint = best_head_checkpoint(directory)
+    if checkpoint is None and directory.exists() and any(directory.iterdir()):
+        raise RuntimeError(
+            f"Incomplete {label} directory exists without a best checkpoint: {directory}. "
+            "Move or delete it, then rerun with --resume."
+        )
+
+
+def resolve_encoder_checkpoint(run: Path) -> Path | None:
+    copied = run / "best_all8_feff_encoder.ckpt"
+    if copied.is_file():
+        return copied
+    checkpoints = sorted((run / "checkpoints").glob("best-*.ckpt"))
+    if not checkpoints:
+        return None
+    best_score, best = min((checkpoint_score(path), path) for path in checkpoints)
+    if not np.isfinite(best_score):
+        raise RuntimeError(f"No finite encoder checkpoint found in {run / 'checkpoints'}")
+    shutil.copy2(best, copied)
+    return copied
+
+
+def feature_split_complete(features: Path, task: str, split: str) -> bool:
+    x_path = features / f"{task}_{split}_X.txt"
+    y_path = features / f"{task}_{split}_y.txt"
+    if not x_path.exists() or not y_path.exists():
+        return False
+    X = np.atleast_2d(np.loadtxt(x_path, dtype=np.float32))
+    y = np.atleast_2d(np.loadtxt(y_path, dtype=np.float32))
+    if X.shape[0] != y.shape[0] or X.shape[1] != INPUT_DIM or y.shape[1] != OUTPUT_DIM:
+        raise ValueError(f"Invalid feature split {task} {split}: X={X.shape} y={y.shape}")
+    if not np.isfinite(X).all() or not np.isfinite(y).all():
+        raise ValueError(f"Non-finite feature split {task} {split}: {features}")
+    return True
+
+
+def missing_feature_splits(features: Path) -> list[tuple[str, str]]:
+    return [
+        (task, split)
+        for task in EXPORT_TASKS
+        for split in SPLITS
+        if not feature_split_complete(features, task, split)
+    ]
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--run-name", default=None)
@@ -407,6 +467,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--gpu", default=None, help="GPU id to expose, e.g. 0 or 1. Equivalent to CUDA_VISIBLE_DEVICES.")
     p.add_argument("--overwrite", action="store_true")
+    p.add_argument("--resume", action="store_true", help="Resume/finalize an existing run: reuse encoder/features/head checkpoints and fill missing stages.")
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--encoder-lr", type=float, default=1e-3)
     p.add_argument("--gnn-dropout", type=float, default=0.1)
@@ -424,70 +485,96 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.resume and args.overwrite:
+        raise ValueError("Use either --resume or --overwrite, not both")
     if int(np.__version__.split(".", 1)[0]) >= 2:
         raise RuntimeError(f"NumPy {np.__version__} is incompatible with torch==2.1/MatGL graph conversion. Run: pip install 'numpy<2' --force-reinstall")
     patch_matgl_gpu_constants()
+
+    root = Path(__file__).resolve().parents[1]
+    raw_root = Path(os.environ.get("OMNIXAS_DATA_ROOT", root.parent / "OmniXAS_data")) / "materialscloud_omnixas_raw" / "extracted"
+    if not raw_root.exists():
+        raise FileNotFoundError(f"Missing raw data root: {raw_root}")
+
+    output_root = Path(args.output_root)
+    output_root = output_root if output_root.is_absolute() else root / output_root
+    run = output_root / (args.run_name or f"{datetime.now():%Y%m%d_%H%M%S}_scratch_all8_seed{args.seed}")
+    settings_path = run / "run_settings.json"
+
+    if args.overwrite and run.exists():
+        shutil.rmtree(run)
+    if args.resume:
+        if not run.exists():
+            raise FileNotFoundError(f"Cannot resume missing run: {run}")
+        if not settings_path.is_file():
+            raise FileNotFoundError(f"Cannot resume run without run_settings.json: {settings_path}")
+        saved = json.loads(settings_path.read_text(encoding="utf-8"))
+        for key in [
+            "seed", "encoder_lr", "gnn_dropout", "encoder_epochs",
+            "universal_lr", "universal_dropout", "universal_epochs", "universal_patience",
+            "tuned_lr", "tuned_dropouts", "tuned_epochs", "tuned_patience",
+        ]:
+            if key in saved:
+                setattr(args, key, saved[key])
+        print(f"resuming end-to-end run: {run}", flush=True)
+    else:
+        if run.exists():
+            raise FileExistsError(f"Run already exists: {run}; use --resume to continue it or --overwrite to replace it")
+        run.mkdir(parents=True)
+        settings = vars(args) | {"run_dir": str(run)}
+        settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+        print(json.dumps(settings, indent=2), flush=True)
+
     pl.seed_everything(args.seed, workers=True)
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.set_float32_matmul_precision("medium")
 
-    root = Path(__file__).resolve().parents[1]
-    raw_root = Path(os.environ.get("OMNIXAS_DATA_ROOT", root.parent / "OmniXAS_data")) / "materialscloud_omnixas_raw" / "extracted"
-    if not raw_root.exists():
-        raise FileNotFoundError(f"Missing raw data root: {raw_root}")
-    output_root = Path(args.output_root)
-    output_root = output_root if output_root.is_absolute() else root / output_root
-    run = output_root / (args.run_name or f"{datetime.now():%Y%m%d_%H%M%S}_scratch_all8_seed{args.seed}")
     features, heads = run / "features", run / "heads"
-    if args.overwrite and run.exists():
-        shutil.rmtree(run)
-    if run.exists():
-        raise FileExistsError(f"Run already exists: {run}; use --overwrite")
-    run.mkdir(parents=True)
+    best_encoder = resolve_encoder_checkpoint(run) if args.resume else None
 
-    settings = vars(args) | {"run_dir": str(run)}
-    (run / "run_settings.json").write_text(json.dumps(settings, indent=2), encoding="utf-8")
-    print(json.dumps(settings, indent=2), flush=True)
+    if best_encoder is None:
+        model = EncoderModel(args.gnn_dropout)
+        collate = CollateGraphs(model.encoder)
+        train_loader = DataLoader(FEFFDataset(root, raw_root, FEFF_TASKS, "train"), batch_size=ENCODER_BATCH, shuffle=True, collate_fn=collate, num_workers=args.num_workers, drop_last=True)
+        val_loader = DataLoader(FEFFDataset(root, raw_root, FEFF_TASKS, "val"), batch_size=ENCODER_BATCH, shuffle=False, collate_fn=collate, num_workers=args.num_workers)
 
-    model = EncoderModel(args.gnn_dropout)
-    collate = CollateGraphs(model.encoder)
-    train_loader = DataLoader(FEFFDataset(root, raw_root, FEFF_TASKS, "train"), batch_size=ENCODER_BATCH, shuffle=True, collate_fn=collate, num_workers=args.num_workers, drop_last=True)
-    val_loader = DataLoader(FEFFDataset(root, raw_root, FEFF_TASKS, "val"), batch_size=ENCODER_BATCH, shuffle=False, collate_fn=collate, num_workers=args.num_workers)
+        data_dir = root / "tutorial_omnixas" / "ml_data"
+        train_base, val_base, counts = [], [], []
+        for task in FEFF_TASKS:
+            train_y = np.atleast_2d(np.loadtxt(data_dir / f"{task}_train_y.txt", dtype=np.float32))
+            counts.append(len(train_y))
+            for split_name, out in [("train", train_base), ("val", val_base)]:
+                y = np.atleast_2d(np.loadtxt(data_dir / f"{task}_{split_name}_y.txt", dtype=np.float32))
+                baseline = np.repeat(train_y.mean(axis=0, keepdims=True), len(y), axis=0)
+                out.append(float(np.median(np.mean((y - baseline) ** 2, axis=1))))
+        counts = torch.tensor(counts, dtype=torch.float32)
 
-    data_dir = root / "tutorial_omnixas" / "ml_data"
-    train_base, val_base, counts = [], [], []
-    for task in FEFF_TASKS:
-        train_y = np.atleast_2d(np.loadtxt(data_dir / f"{task}_train_y.txt", dtype=np.float32))
-        counts.append(len(train_y))
-        for split_name, out in [("train", train_base), ("val", val_base)]:
-            y = np.atleast_2d(np.loadtxt(data_dir / f"{task}_{split_name}_y.txt", dtype=np.float32))
-            baseline = np.repeat(train_y.mean(axis=0, keepdims=True), len(y), axis=0)
-            out.append(float(np.median(np.mean((y - baseline) ** 2, axis=1))))
-    counts = torch.tensor(counts, dtype=torch.float32)
-
-    lit = LitEncoder(
-        model,
-        torch.tensor(train_base, dtype=torch.float32),
-        torch.tensor(val_base, dtype=torch.float32),
-        counts.sum() / (len(FEFF_TASKS) * counts),
-        args.encoder_lr,
-        args.encoder_epochs,
-    )
-    encoder_ckpt = ModelCheckpoint(dirpath=run / "checkpoints", filename="best-{epoch:03d}-{val_balanced_rel_mse:.5f}", monitor="val_balanced_rel_mse", mode="min", save_top_k=1, save_last=True)
-    pl.Trainer(
-        max_epochs=args.encoder_epochs,
-        accelerator="auto",
-        devices=1,
-        callbacks=[EarlyStopping(monitor="val_balanced_rel_mse", patience=ENCODER_PATIENCE, mode="min"), encoder_ckpt],
-        logger=CSVLogger(save_dir=str(run), name="logs"),
-        log_every_n_steps=1,
-    ).fit(lit, train_loader, val_loader)
-    if not encoder_ckpt.best_model_path:
-        raise RuntimeError("Encoder training finished without a best checkpoint")
-    best_encoder = Path(encoder_ckpt.best_model_path)
-    shutil.copy2(best_encoder, run / "best_all8_feff_encoder.ckpt")
+        lit = LitEncoder(
+            model,
+            torch.tensor(train_base, dtype=torch.float32),
+            torch.tensor(val_base, dtype=torch.float32),
+            counts.sum() / (len(FEFF_TASKS) * counts),
+            args.encoder_lr,
+            args.encoder_epochs,
+        )
+        encoder_ckpt = ModelCheckpoint(dirpath=run / "checkpoints", filename="best-{epoch:03d}-{val_balanced_rel_mse:.5f}", monitor="val_balanced_rel_mse", mode="min", save_top_k=1, save_last=True)
+        pl.Trainer(
+            max_epochs=args.encoder_epochs,
+            accelerator="auto",
+            devices=1,
+            callbacks=[EarlyStopping(monitor="val_balanced_rel_mse", patience=ENCODER_PATIENCE, mode="min"), encoder_ckpt],
+            logger=CSVLogger(save_dir=str(run), name="logs"),
+            log_every_n_steps=1,
+        ).fit(lit, train_loader, val_loader)
+        if not encoder_ckpt.best_model_path:
+            raise RuntimeError("Encoder training finished without a best checkpoint")
+        best_encoder = Path(encoder_ckpt.best_model_path)
+        shutil.copy2(best_encoder, run / "best_all8_feff_encoder.ckpt")
+        best_encoder = run / "best_all8_feff_encoder.ckpt"
+    else:
+        print(f"reusing encoder checkpoint: {best_encoder}", flush=True)
 
     model = EncoderModel(args.gnn_dropout)
     state = torch_load(best_encoder).get("state_dict")
@@ -497,19 +584,39 @@ def main() -> None:
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     model = model.to(device).eval()
     collate = CollateGraphs(model.encoder)
-    features.mkdir(parents=True)
-    with torch.no_grad():
-        for task in EXPORT_TASKS:
-            for split_name in SPLITS:
+    features.mkdir(parents=True, exist_ok=True)
+
+    to_export = missing_feature_splits(features)
+    if to_export:
+        print(f"exporting {len(to_export)} missing feature split(s)", flush=True)
+        with torch.inference_mode():
+            for task, split_name in to_export:
                 loader = DataLoader(FEFFDataset(root, raw_root, [task], split_name), batch_size=ENCODER_BATCH, shuffle=False, collate_fn=collate, num_workers=args.num_workers)
                 Xs, ys = [], []
                 for batch in loader:
+                    if task.endswith("_VASP"):
+                        graph_sizes = torch.as_tensor(batch["graph"].batch_num_nodes(), dtype=batch["site"].dtype)
+                        expected_sites = torch.cat([graph_sizes.new_zeros(1), graph_sizes.cumsum(0)[:-1]])
+                        if not torch.equal(batch["site"], expected_sites):
+                            raise RuntimeError(f"VASP absorbers are not node 0 for {task} {split_name}")
                     z = model.encoder(batch["graph"].to(device), batch["site"].to(device))
                     Xs.append((z * FEATURE_SCALE).cpu().numpy())
                     ys.append(batch["y"].numpy())
-                np.savetxt(features / f"{task}_{split_name}_X.txt", np.concatenate(Xs))
-                np.savetxt(features / f"{task}_{split_name}_y.txt", np.concatenate(ys))
-                print(f"exported {task} {split_name}", flush=True)
+                X = np.concatenate(Xs)
+                y = np.concatenate(ys)
+                if X.shape != (len(y), INPUT_DIM) or y.shape[1] != OUTPUT_DIM:
+                    raise ValueError(f"Invalid export for {task} {split_name}: X={X.shape} y={y.shape}")
+                if not np.isfinite(X).all() or not np.isfinite(y).all():
+                    raise ValueError(f"Non-finite export for {task} {split_name}")
+                np.savetxt(features / f"{task}_{split_name}_X.txt", X)
+                np.savetxt(features / f"{task}_{split_name}_y.txt", y)
+                print(f"exported {task} {split_name}: X={X.shape} y={y.shape}", flush=True)
+    else:
+        print("all FEFF and VASP feature splits already present", flush=True)
+
+    still_missing = missing_feature_splits(features)
+    if still_missing:
+        raise RuntimeError(f"Feature export did not complete: {still_missing}")
 
     all_splits = [load_feature_split(features, task) for task in FEFF_TASKS]
     universal_split = MLSplits(
@@ -518,9 +625,14 @@ def main() -> None:
         test=MLData(X=np.concatenate([s.test.X for s in all_splits]), y=np.concatenate([s.test.y for s in all_splits])),
     )
     universal_dir = heads / "universalXAS" / "All_FEFF" / "runs" / f"universal_seed{args.seed}_lr{args.universal_lr}_dropout{args.universal_dropout}"
-    universal = regressor(universal_dir, args.universal_lr, args.universal_dropout, 32, args.universal_epochs, args.universal_patience)
-    universal.fit(universal_split)
-    universal_ckpt = Path(universal.cfg.fetch_checkpoint("best"))
+    universal_ckpt = best_head_checkpoint(universal_dir)
+    if universal_ckpt is None:
+        ensure_no_incomplete_head(universal_dir, "UniversalXAS")
+        universal = regressor(universal_dir, args.universal_lr, args.universal_dropout, 32, args.universal_epochs, args.universal_patience)
+        universal.fit(universal_split)
+        universal_ckpt = Path(universal.cfg.fetch_checkpoint("best"))
+    else:
+        print(f"reusing UniversalXAS checkpoint: {universal_ckpt}", flush=True)
 
     universal_rows = []
     for task in EXPORT_TASKS:
@@ -540,12 +652,17 @@ def main() -> None:
         split = load_feature_split(features, task)
         for dropout in args.tuned_dropouts:
             out_dir = heads / "tunedUniversalXAS" / task / "runs" / f"tuned_seed{args.seed}_lr{args.tuned_lr}_dropout{dropout}"
-            tuned = regressor(source_dir, args.tuned_lr, dropout, BATCH[task], args.tuned_epochs, args.tuned_patience)
-            tuned.load("best")
-            tuned.cfg.directory = str(out_dir)
-            out_dir.mkdir(parents=True, exist_ok=False)
-            tuned.fit(split)
-            ckpt = Path(tuned.cfg.fetch_checkpoint("best"))
+            ckpt = best_head_checkpoint(out_dir)
+            if ckpt is None:
+                ensure_no_incomplete_head(out_dir, f"Tuned-UniversalXAS {task} dropout={dropout}")
+                tuned = regressor(source_dir, args.tuned_lr, dropout, BATCH[task], args.tuned_epochs, args.tuned_patience)
+                tuned.load("best")
+                tuned.cfg.directory = str(out_dir)
+                out_dir.mkdir(parents=True, exist_ok=True)
+                tuned.fit(split)
+                ckpt = Path(tuned.cfg.fetch_checkpoint("best"))
+            else:
+                print(f"reusing tuned checkpoint for {task} dropout={dropout}: {ckpt}", flush=True)
             row = {"element": element, "type": kind, "dataset": task, "dropout": dropout, "checkpoint": str(ckpt), "val_loss_score": checkpoint_score(ckpt)}
             row.update(eval_ckpt(ckpt, split, "val"))
             row.update(eval_ckpt(ckpt, split, "test"))
@@ -554,7 +671,6 @@ def main() -> None:
     csv_write(run / "tuned_eval_all.csv", tuned_rows)
     csv_write(run / "tuned_eval.csv", [max([row for row in tuned_rows if row["dataset"] == task], key=lambda row: row["val_eta"]) for task in EXPORT_TASKS])
     print("done:", run, flush=True)
-
 
 if __name__ == "__main__":
     main()
