@@ -149,18 +149,58 @@ def parse_feff_structure(path: Path) -> Structure:
     return Structure(Lattice.from_parameters(*abc, *angles), species, coords, coords_are_cartesian=False)
 
 
-def load_structure(raw_root: Path, task: str, material_id: str, site: int) -> Structure:
+def structure_path(raw_root: Path, task: str, material_id: str, site: int) -> Path:
     element, kind = task.split("_", 1)
     material_dir = raw_root / kind / element / material_id
     if kind == "VASP":
-        structure = Structure.from_file(material_dir / "VASP" / f"{site:03d}_{element}" / "POSCAR")
+        return material_dir / "VASP" / f"{site:03d}_{element}" / "POSCAR"
+    poscar = material_dir / "POSCAR"
+    if poscar.exists():
+        return poscar
+    return material_dir / "FEFF-XANES" / f"{site:03d}_{element}" / "feff.inp"
+
+
+def validate_raw_structures(root: Path, raw_root: Path, tasks: list[str]) -> None:
+    id_dir = root / "tutorial_omnixas" / "material_id_and_site"
+    missing = []
+    for task in tasks:
+        for split in SPLITS:
+            for line in (id_dir / f"{task}_{split}.txt").read_text().splitlines():
+                if not line.strip():
+                    continue
+                material_id, site = line.strip().rsplit("_", 1)
+                path = structure_path(raw_root, task, material_id, int(site))
+                if not path.exists():
+                    missing.append((task, split, line.strip(), path))
+    if not missing:
+        return
+
+    examples = "\n".join(
+        f"  {task} {split} {row}: {path}"
+        for task, split, row, path in missing[:8]
+    )
+    raise FileNotFoundError(
+        f"Missing {len(missing)} raw structure file(s) under {raw_root}.\n"
+        f"First missing files:\n{examples}\n"
+        "Full FEFF+VASP export needs the raw VASP core-hole POSCAR folders. "
+        "Set OMNIXAS_DATA_ROOT to the directory containing materialscloud_omnixas_raw, "
+        "or rerun with --tasks feff to finish the FEFF-only pipeline."
+    )
+
+
+def load_structure(raw_root: Path, task: str, material_id: str, site: int) -> Structure:
+    element, kind = task.split("_", 1)
+    path = structure_path(raw_root, task, material_id, site)
+    if not path.exists():
+        raise FileNotFoundError(f"Missing raw structure for {task} {material_id}_{site:03d}: {path}")
+    if kind == "VASP":
+        structure = Structure.from_file(path)
         if structure[0].specie.symbol != element:
             raise ValueError(f"VASP absorber is not first in {material_id} site {site}: {structure[0].specie}")
         return structure
-    poscar = material_dir / "POSCAR"
-    if poscar.exists():
-        return Structure.from_file(poscar)
-    return parse_feff_structure(material_dir / "FEFF-XANES" / f"{site:03d}_{element}" / "feff.inp")
+    if path.name == "POSCAR":
+        return Structure.from_file(path)
+    return parse_feff_structure(path)
 
 
 class FEFFDataset(Dataset):
@@ -198,10 +238,10 @@ class CollateGraphs:
         out = self.converter.get_graph(structure)
         if len(out) == 2:
             graph, _ = out
-            lat = torch.as_tensor(structure.lattice.matrix, dtype=torch.float32)
+            lat = torch.tensor(np.array(structure.lattice.matrix, dtype=np.float32, copy=True))
         else:
             graph, lat, _ = out
-            lat = torch.as_tensor(lat[0] if getattr(lat, "ndim", 0) == 3 else lat, dtype=torch.float32)
+            lat = torch.tensor(np.array(lat[0] if getattr(lat, "ndim", 0) == 3 else lat, dtype=np.float32, copy=True))
         if "pbc_offshift" in graph.edata:
             graph.edata["pbc_offshift"] = graph.edata["pbc_offshift"].to(torch.float32)
         else:
@@ -211,7 +251,7 @@ class CollateGraphs:
         elif "frac_coords" in graph.ndata:
             graph.ndata["pos"] = graph.ndata["frac_coords"].to(torch.float32) @ lat
         else:
-            graph.ndata["pos"] = torch.as_tensor(structure.cart_coords, dtype=torch.float32)
+            graph.ndata["pos"] = torch.tensor(np.array(structure.cart_coords, dtype=np.float32, copy=True))
         graph.edata["bond_vec"], graph.edata["bond_dist"] = compute_pair_vector_and_distance(graph)
         return graph
 
@@ -451,10 +491,10 @@ def feature_split_complete(features: Path, task: str, split: str) -> bool:
     return True
 
 
-def missing_feature_splits(features: Path) -> list[tuple[str, str]]:
+def missing_feature_splits(features: Path, tasks: list[str]) -> list[tuple[str, str]]:
     return [
         (task, split)
-        for task in EXPORT_TASKS
+        for task in tasks
         for split in SPLITS
         if not feature_split_complete(features, task, split)
     ]
@@ -468,6 +508,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--gpu", default=None, help="GPU id to expose, e.g. 0 or 1. Equivalent to CUDA_VISIBLE_DEVICES.")
     p.add_argument("--overwrite", action="store_true")
     p.add_argument("--resume", action="store_true", help="Resume/finalize an existing run: reuse encoder/features/head checkpoints and fill missing stages.")
+    p.add_argument("--tasks", choices=["all", "feff"], default="all", help="all = FEFF plus Ti/Cu VASP; feff = skip VASP export/evaluation.")
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--encoder-lr", type=float, default=1e-3)
     p.add_argument("--gnn-dropout", type=float, default=0.1)
@@ -531,6 +572,9 @@ def main() -> None:
     torch.manual_seed(args.seed)
     torch.set_float32_matmul_precision("medium")
 
+    export_tasks = FEFF_TASKS if args.tasks == "feff" else EXPORT_TASKS
+    validate_raw_structures(root, raw_root, export_tasks)
+
     features, heads = run / "features", run / "heads"
     best_encoder = resolve_encoder_checkpoint(run) if args.resume else None
 
@@ -586,7 +630,7 @@ def main() -> None:
     collate = CollateGraphs(model.encoder)
     features.mkdir(parents=True, exist_ok=True)
 
-    to_export = missing_feature_splits(features)
+    to_export = missing_feature_splits(features, export_tasks)
     if to_export:
         print(f"exporting {len(to_export)} missing feature split(s)", flush=True)
         with torch.inference_mode():
@@ -614,7 +658,7 @@ def main() -> None:
     else:
         print("all FEFF and VASP feature splits already present", flush=True)
 
-    still_missing = missing_feature_splits(features)
+    still_missing = missing_feature_splits(features, export_tasks)
     if still_missing:
         raise RuntimeError(f"Feature export did not complete: {still_missing}")
 
@@ -635,7 +679,7 @@ def main() -> None:
         print(f"reusing UniversalXAS checkpoint: {universal_ckpt}", flush=True)
 
     universal_rows = []
-    for task in EXPORT_TASKS:
+    for task in export_tasks:
         element, kind = task.split("_", 1)
         split = load_feature_split(features, task)
         row = {"element": element, "type": kind, "dataset": task, "checkpoint": str(universal_ckpt), "val_loss_score": checkpoint_score(universal_ckpt)}
@@ -647,7 +691,7 @@ def main() -> None:
 
     tuned_rows = []
     source_dir = universal_ckpt.parent
-    for task in EXPORT_TASKS:
+    for task in export_tasks:
         element, kind = task.split("_", 1)
         split = load_feature_split(features, task)
         for dropout in args.tuned_dropouts:
@@ -669,7 +713,7 @@ def main() -> None:
             tuned_rows.append(row)
             print(f"tuned {task} dropout={dropout}: val_eta={row['val_eta']:.4f} test_eta={row['test_eta']:.4f}", flush=True)
     csv_write(run / "tuned_eval_all.csv", tuned_rows)
-    csv_write(run / "tuned_eval.csv", [max([row for row in tuned_rows if row["dataset"] == task], key=lambda row: row["val_eta"]) for task in EXPORT_TASKS])
+    csv_write(run / "tuned_eval.csv", [max([row for row in tuned_rows if row["dataset"] == task], key=lambda row: row["val_eta"]) for task in export_tasks])
     print("done:", run, flush=True)
 
 if __name__ == "__main__":
