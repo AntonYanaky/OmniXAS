@@ -409,8 +409,8 @@ def continue_heads(run: Path, e2e_ckpt: Path, features: Path, args: argparse.Nam
             print(f"reusing continued {task} head: {ckpt}", flush=True)
         element, kind = task.split("_", 1)
         row = {"element": element, "type": kind, "dataset": task, "checkpoint": str(ckpt), "val_loss_score": checkpoint_score(ckpt)}
-        row.update(eval_ckpt(ckpt, split, "val"))
-        row.update(eval_ckpt(ckpt, split, "test"))
+        row.update(eval_ckpt(ckpt, split, "val", EXPERT_DIMS[task]))
+        row.update(eval_ckpt(ckpt, split, "test", EXPERT_DIMS[task]))
         rows.append(row)
         print(f"continued {task}: val_eta={row['val_eta']:.4f} test_eta={row['test_eta']:.4f}", flush=True)
     csv_write(run / "continued_expert_eval.csv", rows)

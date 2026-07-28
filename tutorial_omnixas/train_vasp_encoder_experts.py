@@ -315,8 +315,8 @@ def train_experts(run: Path, features: Path, args: argparse.Namespace) -> None:
             print(f"expert cached for {task}: {ckpt}", flush=True)
         element, kind = task.split("_", 1)
         row = {"element": element, "type": kind, "dataset": task, "checkpoint": str(ckpt), "val_loss_score": checkpoint_score(ckpt)}
-        row.update(eval_ckpt(ckpt, split, "val"))
-        row.update(eval_ckpt(ckpt, split, "test"))
+        row.update(eval_ckpt(ckpt, split, "val", h["hidden_dims"]))
+        row.update(eval_ckpt(ckpt, split, "test", h["hidden_dims"]))
         rows.append(row)
         print(f"expert {task}: val_eta={row['val_eta']:.4f} test_eta={row['test_eta']:.4f}", flush=True)
     csv_write(run / "expert_eval.csv", rows)

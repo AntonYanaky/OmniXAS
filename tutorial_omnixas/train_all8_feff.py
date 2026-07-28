@@ -429,8 +429,9 @@ def checkpoint_score(ckpt: Path) -> float:
     return value if np.isfinite(value) else float("inf")
 
 
-def eval_ckpt(ckpt: Path, split: MLSplits, split_name: str) -> dict[str, float]:
-    module = PlModule.load_from_checkpoint(checkpoint_path=str(ckpt), model=XASBlock(INPUT_DIM, HEAD_WIDTHS, OUTPUT_DIM), lr=1e-4)
+def eval_ckpt(ckpt: Path, split: MLSplits, split_name: str, hidden_dims: list[int] | None = None) -> dict[str, float]:
+    widths = HEAD_WIDTHS if hidden_dims is None else list(hidden_dims)
+    module = PlModule.load_from_checkpoint(checkpoint_path=str(ckpt), model=XASBlock(INPUT_DIM, widths, OUTPUT_DIM), lr=1e-4)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     module = module.to(device).eval()
     X, y = getattr(split, split_name).X, getattr(split, split_name).y
