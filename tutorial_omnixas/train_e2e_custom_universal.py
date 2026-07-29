@@ -316,7 +316,7 @@ def load_e2e_model(ckpt: Path, args: argparse.Namespace, device: torch.device) -
 
 def export_features(run: Path, e2e_ckpt: Path, root: Path, raw_root: Path, args: argparse.Namespace) -> Path:
     features = run / "features"
-    missing = missing_feature_splits(features)
+    missing = missing_feature_splits(features, EXPORT_TASKS)
     if not missing:
         print("all FEFF/VASP features already present", flush=True)
         return features
@@ -351,7 +351,7 @@ def export_features(run: Path, e2e_ckpt: Path, root: Path, raw_root: Path, args:
             np.savetxt(features / f"{task}_{split_name}_X.txt", X)
             np.savetxt(features / f"{task}_{split_name}_y.txt", y)
             print(f"exported {task} {split_name}: X={X.shape} y={y.shape}", flush=True)
-    if still_missing := missing_feature_splits(features):
+    if still_missing := missing_feature_splits(features, EXPORT_TASKS):
         raise RuntimeError(f"Feature export incomplete: {still_missing}")
     return features
 
