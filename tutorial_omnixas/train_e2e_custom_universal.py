@@ -93,6 +93,9 @@ class LitEndToEnd(pl.LightningModule):
         head_lr: float,
         weight_decay: float,
         epochs: int,
+        scheduler: str,
+        plateau_factor: float,
+        plateau_patience: int,
     ):
         super().__init__()
         self.model = model
@@ -101,6 +104,9 @@ class LitEndToEnd(pl.LightningModule):
         self.head_lr = head_lr
         self.weight_decay = weight_decay
         self.epochs = epochs
+        self.scheduler = scheduler
+        self.plateau_factor = plateau_factor
+        self.plateau_patience = plateau_patience
         self.register_buffer("train_base", train_base.float())
         self.register_buffer("val_base", val_base.float())
         self.register_buffer("task_weights", task_weights.float())
@@ -158,13 +164,33 @@ class LitEndToEnd(pl.LightningModule):
             ],
             weight_decay=self.weight_decay,
         )
-        return {
-            "optimizer": opt,
-            "lr_scheduler": {
-                "scheduler": torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=self.epochs, eta_min=TUNED_ETA_MIN),
-                "interval": "epoch",
-            },
-        }
+        if self.scheduler == "none":
+            return opt
+        if self.scheduler == "cosine":
+            return {
+                "optimizer": opt,
+                "lr_scheduler": {
+                    "scheduler": torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=self.epochs, eta_min=TUNED_ETA_MIN),
+                    "interval": "epoch",
+                },
+            }
+        if self.scheduler == "plateau":
+            return {
+                "optimizer": opt,
+                "lr_scheduler": {
+                    "scheduler": torch.optim.lr_scheduler.ReduceLROnPlateau(
+                        opt,
+                        mode="min",
+                        factor=self.plateau_factor,
+                        patience=self.plateau_patience,
+                        min_lr=TUNED_ETA_MIN,
+                    ),
+                    "interval": "epoch",
+                    "frequency": 2,
+                    "monitor": "val_balanced_rel_mse",
+                },
+            }
+        raise ValueError(f"Unsupported E2E scheduler: {self.scheduler}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -181,13 +207,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--e2e-encoder-lr", type=float, default=1e-3)
     p.add_argument("--e2e-head-lr", type=float, default=7e-4)
     p.add_argument("--e2e-head-dropout", type=float, default=0.25)
+    p.add_argument("--e2e-scheduler", choices=["cosine", "plateau", "none"], default="cosine")
+    p.add_argument("--e2e-plateau-factor", type=float, default=0.5)
+    p.add_argument("--e2e-plateau-patience", type=int, default=8)
     p.add_argument("--weight-decay", type=float, default=1e-5)
     p.add_argument("--universal-lr", type=float, default=7e-4)
     p.add_argument("--universal-dropout", type=float, default=0.25)
     p.add_argument("--universal-epochs", type=int, default=800)
     p.add_argument("--universal-patience", type=int, default=60)
+    p.add_argument("--universal-scheduler", choices=["cosine", "plateau", "warmup_cosine", "none"], default="cosine")
+    p.add_argument("--universal-cosine-t", type=int, default=None)
+    p.add_argument("--universal-plateau-factor", type=float, default=0.5)
+    p.add_argument("--universal-plateau-patience", type=int, default=8)
     p.add_argument("--tuned-epochs", type=int, default=1000)
     p.add_argument("--tuned-patience", type=int, default=25)
+    p.add_argument("--fixed-feff-tuned", action="store_true", help="For FEFF tuned heads, train only cosT500_lr3e-4_do0p1 instead of the three-setting sweep.")
     return p.parse_args()
 
 
@@ -222,7 +256,20 @@ def ensure_clean_or_complete(directory: Path, label: str) -> None:
         raise RuntimeError(f"Incomplete {label} exists without a best checkpoint: {directory}")
 
 
-def build_head_regressor(directory: Path, *, lr: float, dropout: float, batch: int, epochs: int, patience: int, scheduler: str, cosine_t: int, warmup_epochs: int = 10) -> XASBlockRegressor:
+def build_head_regressor(
+    directory: Path,
+    *,
+    lr: float,
+    dropout: float,
+    batch: int,
+    epochs: int,
+    patience: int,
+    scheduler: str,
+    cosine_t: int,
+    warmup_epochs: int = 10,
+    plateau_factor: float = 0.5,
+    plateau_patience: int = 5,
+) -> XASBlockRegressor:
     XASBlock.DROPOUT = dropout
     return XASBlockRegressor(
         directory=str(directory),
@@ -243,6 +290,8 @@ def build_head_regressor(directory: Path, *, lr: float, dropout: float, batch: i
         cosine_t_max=cosine_t,
         cosine_eta_min=TUNED_ETA_MIN,
         warmup_epochs=warmup_epochs,
+        plateau_factor=plateau_factor,
+        plateau_patience=plateau_patience,
     )
 
 
@@ -316,7 +365,11 @@ def universal_split(features: Path) -> MLSplits:
     )
 
 
-def tuned_sweep(task: str) -> list[dict[str, Any]]:
+def tuned_sweep(task: str, args: argparse.Namespace) -> list[dict[str, Any]]:
+    if args.fixed_feff_tuned and task.endswith("_FEFF"):
+        return [
+            {"name": "cosT500_lr3e-4_do0p1", "lr": 3e-4, "dropout": 0.10, "scheduler": "cosine", "cosine_t": 500, "warmup": 0},
+        ]
     if task == "Ti_VASP":
         return [
             {"name": "warmcosT600_lr5e-4_do0p1_w20", "lr": 5e-4, "dropout": 0.10, "scheduler": "warmup_cosine", "cosine_t": 600, "warmup": 20},
@@ -348,7 +401,20 @@ def train_e2e(run: Path, root: Path, raw_root: Path, args: argparse.Namespace) -
     collate = CollateGraphs(model.encoder)
     train_loader = DataLoader(FEFFDataset(root, raw_root, tasks, "train"), batch_size=ENCODER_BATCH, shuffle=True, collate_fn=collate, num_workers=args.num_workers, drop_last=True)
     val_loader = DataLoader(FEFFDataset(root, raw_root, tasks, "val"), batch_size=ENCODER_BATCH, shuffle=False, collate_fn=collate, num_workers=args.num_workers)
-    lit = LitEndToEnd(model, tasks, train_base, val_base, weights, args.e2e_encoder_lr, args.e2e_head_lr, args.weight_decay, args.e2e_epochs)
+    lit = LitEndToEnd(
+        model,
+        tasks,
+        train_base,
+        val_base,
+        weights,
+        args.e2e_encoder_lr,
+        args.e2e_head_lr,
+        args.weight_decay,
+        args.e2e_epochs,
+        args.e2e_scheduler,
+        args.e2e_plateau_factor,
+        args.e2e_plateau_patience,
+    )
     ckpt = ModelCheckpoint(dirpath=run / "checkpoints", filename="best-{epoch:03d}-{val_balanced_rel_mse:.5f}", monitor="val_balanced_rel_mse", mode="min", save_top_k=1, save_last=True)
     pl.Trainer(
         max_epochs=args.e2e_epochs,
@@ -365,7 +431,12 @@ def train_e2e(run: Path, root: Path, raw_root: Path, args: argparse.Namespace) -
 
 
 def continue_universal(run: Path, e2e_ckpt: Path, features: Path, args: argparse.Namespace) -> Path:
-    out = run / "heads" / "universalXAS" / "All_FEFF_VASP" / "runs" / f"continued_seed{args.seed}_lr{args.universal_lr}_dropout{args.universal_dropout}"
+    scheduler_tag = args.universal_scheduler
+    if args.universal_scheduler == "cosine":
+        scheduler_tag = f"cosT{args.universal_cosine_t or args.universal_epochs}"
+    elif args.universal_scheduler == "plateau":
+        scheduler_tag = f"plateauP{args.universal_plateau_patience}"
+    out = run / "heads" / "universalXAS" / "All_FEFF_VASP" / "runs" / f"continued_seed{args.seed}_lr{args.universal_lr}_dropout{args.universal_dropout}_{scheduler_tag}"
     ckpt = best_checkpoint(out)
     if ckpt is not None:
         print(f"reusing continued UniversalXAS checkpoint: {ckpt}", flush=True)
@@ -378,8 +449,10 @@ def continue_universal(run: Path, e2e_ckpt: Path, features: Path, args: argparse
         batch=32,
         epochs=args.universal_epochs,
         patience=args.universal_patience,
-        scheduler="cosine",
-        cosine_t=args.universal_epochs,
+        scheduler=args.universal_scheduler,
+        cosine_t=args.universal_cosine_t or args.universal_epochs,
+        plateau_factor=args.universal_plateau_factor,
+        plateau_patience=args.universal_plateau_patience,
     )
     reg.model.model.load_state_dict(head_state_from_e2e(e2e_ckpt), strict=True)
     reg.fit(universal_split(features))
@@ -407,7 +480,7 @@ def tune_all(continued_ckpt: Path, features: Path, run: Path, args: argparse.Nam
         element, kind = task.split("_", 1)
         split = load_feature_split(features, task)
         task_rows = []
-        for cfg in tuned_sweep(task):
+        for cfg in tuned_sweep(task, args):
             out = run / "heads" / "tunedUniversalXAS" / task / "runs" / f"{cfg['name']}_seed{args.seed}"
             ckpt = best_checkpoint(out)
             if ckpt is None:
@@ -430,7 +503,7 @@ def tune_all(continued_ckpt: Path, features: Path, run: Path, args: argparse.Nam
                 ckpt = Path(reg.cfg.fetch_checkpoint("best"))
             else:
                 print(f"reusing tuned checkpoint for {task} {cfg['name']}: {ckpt}", flush=True)
-            row = {"element": element, "type": kind, "dataset": task, "setting": cfg["name"], "dropout": cfg["dropout"], "lr": cfg["lr"], "checkpoint": str(ckpt), "val_loss_score": checkpoint_score(ckpt)}
+            row = {"element": element, "type": kind, "dataset": task, "setting": cfg["name"], "dropout": cfg["dropout"], "lr": cfg["lr"], "scheduler": cfg["scheduler"], "checkpoint": str(ckpt), "val_loss_score": checkpoint_score(ckpt)}
             row.update(eval_ckpt(ckpt, split, "val"))
             candidate_rows.append(row)
             task_rows.append(row)
