@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
 """Train and evaluate AnionXAS UniversalXAS heads.
 
+On the first run, the script prepares the material-level training arrays from
+raw feature and spectral NPZ archives. Existing prepared data is reused.
 Example: ``python tutorial_omnixas/train_anionxas_universal.py --gpu 0``
 """
 
 from __future__ import annotations
 
 import argparse
+import ast
 from collections import Counter
+from datetime import datetime, timezone
 import json
+import math
 import os
 from pathlib import Path
 import shutil
 import sys
+import tempfile
 from typing import Any
 
 # Set the device before importing torch or Lightning.
@@ -45,6 +51,20 @@ INPUT_DIM = 64
 OUTPUT_DIM = 200
 HIDDEN_DIMS = [500, 500, 550]
 SEED = 42
+DEFAULT_FEATURE_NPZ = (
+    Path.home()
+    / "data"
+    / "anionxas_drive"
+    / "drive-download-20260804T124325Z-1-001"
+    / "final_feature_data.npz"
+)
+DEFAULT_SPECTRAL_NPZ = (
+    Path.home()
+    / "data"
+    / "anionxas_drive"
+    / "drive-download-20260804T124325Z-1-001"
+    / "final_spectral_data.npz"
+)
 DEFAULT_RUN_NAME = "anionxas_universal_first_benchmark"
 DEFAULT_TUNED_ELEMENTS = ["Ti", "V", "Cr", "Mn", "Fe", "Co", "Ni", "Cu"]
 TUNED_SETTINGS = [
@@ -122,8 +142,21 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Prepared AnionXAS directory. Uses ANIONXAS_UNIVERSAL_DATA_DIR "
-            "or output/anionxas_universal_prepared."
+            "or output/anionxas_universal_prepared. Missing data is prepared "
+            "from the raw NPZ options."
         ),
+    )
+    parser.add_argument(
+        "--feature-npz",
+        type=Path,
+        default=DEFAULT_FEATURE_NPZ,
+        help="Raw feature NPZ used when the prepared data directory is missing.",
+    )
+    parser.add_argument(
+        "--spectral-npz",
+        type=Path,
+        default=DEFAULT_SPECTRAL_NPZ,
+        help="Raw spectral NPZ used when the prepared data directory is missing.",
     )
     parser.add_argument(
         "--training-root",
@@ -175,10 +208,274 @@ def resolve_path(value: str | None, environment_name: str, fallback: Path) -> Pa
     return Path(raw_value).expanduser().resolve()
 
 
+def _parse_npz_key(key: str) -> tuple[str, str, int]:
+    """Parse one raw archive key without executing arbitrary code."""
+    try:
+        parsed = ast.literal_eval(key)
+    except (SyntaxError, ValueError, TypeError) as exc:
+        raise ValueError(f"Raw NPZ key {key!r} is not a valid tuple literal") from exc
+    if not isinstance(parsed, tuple) or len(parsed) != 3:
+        raise ValueError(
+            f"Raw NPZ key {key!r} must be exactly (element, material_id, site)"
+        )
+    element, material_id, raw_site = parsed
+    if not isinstance(element, str):
+        raise ValueError(f"Raw NPZ key {key!r} element must be a string")
+    if not isinstance(material_id, str):
+        raise ValueError(f"Raw NPZ key {key!r} material_id must be a string")
+    if isinstance(raw_site, bool):
+        raise ValueError(f"Raw NPZ key {key!r} site must not be boolean")
+    if isinstance(raw_site, float) and (
+        not math.isfinite(raw_site) or not raw_site.is_integer()
+    ):
+        raise ValueError(f"Raw NPZ key {key!r} site must be an integer")
+    try:
+        site = int(raw_site)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"Raw NPZ key {key!r} site must be int-compatible") from exc
+    if site < np.iinfo(np.int64).min or site > np.iinfo(np.int64).max:
+        raise ValueError(f"Raw NPZ key {key!r} site is outside the int64 range")
+    return element, material_id, site
+
+
+def _as_float32_vector(value: Any, label: str, expected_dim: int) -> np.ndarray:
+    array = np.asarray(value)
+    if array.ndim != 1 or array.shape[0] != expected_dim:
+        raise ValueError(
+            f"{label} must have shape ({expected_dim},); got {array.shape}"
+        )
+    if array.dtype.kind not in "iuf":
+        raise ValueError(f"{label} must have a real numeric dtype; got {array.dtype}")
+    try:
+        with np.errstate(over="ignore", invalid="ignore"):
+            converted = np.asarray(array, dtype=np.float32)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{label} could not be converted to float32") from exc
+    if not np.isfinite(converted).all():
+        raise ValueError(f"{label} contains non-finite values or overflows float32")
+    return converted
+
+
+def _open_raw_npz(path: Path, label: str) -> np.lib.npyio.NpzFile:
+    if not path.exists():
+        raise FileNotFoundError(f"{label} does not exist: {path}")
+    if not path.is_file():
+        raise FileNotFoundError(f"{label} is not a file: {path}")
+    try:
+        archive = np.load(path, allow_pickle=False)
+    except Exception as exc:
+        raise ValueError(f"Could not load {label} {path}: {exc}") from exc
+    if not isinstance(archive, np.lib.npyio.NpzFile):
+        raise ValueError(f"{label} is not an NPZ archive: {path}")
+    return archive
+
+
+def _choose_preparation_split(
+    candidates: list[int], deficits: np.ndarray, current: np.ndarray, targets: np.ndarray
+) -> int:
+    if any(deficits[split] > 0 for split in candidates):
+        return max(candidates, key=lambda split: deficits[split])
+
+    def ratio(split: int) -> float:
+        target = targets[split]
+        return math.inf if target <= 0 else current[split] / target
+
+    return min(candidates, key=ratio)
+
+
+def _assign_preparation_splits(material_counts: Counter[str]) -> dict[str, int]:
+    """Assign whole materials with the frozen seed-42 80/10/10 policy."""
+    if len(material_counts) < 3:
+        raise ValueError(
+            "At least three materials are required for nonempty train, val, and test splits"
+        )
+    materials = sorted(material_counts)
+    rng = np.random.default_rng(SEED)
+    shuffled = [materials[int(index)] for index in rng.permutation(len(materials))]
+    ordered = sorted(shuffled, key=lambda material: -material_counts[material])
+    targets = np.asarray((0.8, 0.1, 0.1), dtype=np.float64) * sum(material_counts.values())
+    current = np.zeros(3, dtype=np.int64)
+    assignments: dict[str, int] = {}
+
+    for position, material in enumerate(ordered):
+        remaining = len(ordered) - position - 1
+        empty_splits = [split for split in range(3) if current[split] == 0]
+        candidates = empty_splits if empty_splits and remaining <= len(empty_splits) else [0, 1, 2]
+        split = _choose_preparation_split(candidates, targets - current, current, targets)
+        assignments[material] = split
+        current[split] += material_counts[material]
+
+    if np.any(current == 0):
+        raise ValueError(f"Preparation produced an empty split: {current.tolist()}")
+    return assignments
+
+
+def _write_prepared_outputs(
+    directory: Path,
+    X: np.ndarray,
+    y: np.ndarray,
+    elements: list[str],
+    material_ids: list[str],
+    sites: list[int],
+    split_codes: np.ndarray,
+    metadata: dict[str, Any],
+) -> None:
+    np.save(directory / "X.npy", X, allow_pickle=False)
+    np.save(directory / "y.npy", y, allow_pickle=False)
+    np.save(directory / "elements.npy", np.asarray(elements, dtype=str), allow_pickle=False)
+    np.save(
+        directory / "material_ids.npy",
+        np.asarray(material_ids, dtype=str),
+        allow_pickle=False,
+    )
+    np.save(directory / "sites.npy", np.asarray(sites, dtype=np.int64), allow_pickle=False)
+    np.save(directory / "split_codes.npy", split_codes.astype(np.int8, copy=False), allow_pickle=False)
+    with (directory / "metadata.json").open("w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, indent=2, sort_keys=True, allow_nan=False)
+        handle.write("\n")
+
+
+def prepare_anionxas_data(
+    feature_npz: Path, spectral_npz: Path, data_dir: Path
+) -> dict[str, Any]:
+    """Prepare the seven arrays required by this trainer in one atomic operation."""
+    data_dir = Path(data_dir).expanduser()
+    if os.path.lexists(data_dir):
+        raise FileExistsError(
+            f"Prepared data path already exists, refusing to overwrite: {data_dir}"
+        )
+    feature_path = Path(feature_npz).expanduser()
+    spectral_path = Path(spectral_npz).expanduser()
+    feature_archive = None
+    spectral_archive = None
+    try:
+        feature_archive = _open_raw_npz(feature_path, "Feature NPZ")
+        spectral_archive = _open_raw_npz(spectral_path, "Spectral NPZ")
+        feature_keys = set(feature_archive.files)
+        spectral_keys = set(spectral_archive.files)
+        if feature_keys != spectral_keys:
+            raise ValueError(
+                "Feature and spectral NPZ key sets differ: "
+                f"missing from spectral={sorted(feature_keys - spectral_keys)!r}, "
+                f"missing from feature={sorted(spectral_keys - feature_keys)!r}"
+            )
+        if not feature_keys:
+            raise ValueError("Feature and spectral NPZ archives contain no arrays")
+
+        records = [(*_parse_npz_key(key), key) for key in feature_keys]
+        records.sort(key=lambda record: (record[0], record[1], record[2], record[3]))
+        X = np.empty((len(records), INPUT_DIM), dtype=np.float32)
+        y = np.empty((len(records), OUTPUT_DIM), dtype=np.float32)
+        elements: list[str] = []
+        material_ids: list[str] = []
+        sites: list[int] = []
+        for index, (element, material_id, site, key) in enumerate(records):
+            try:
+                feature = _as_float32_vector(
+                    feature_archive[key], f"feature array for key {key!r}", INPUT_DIM
+                )
+                target = _as_float32_vector(
+                    spectral_archive[key], f"spectral array for key {key!r}", OUTPUT_DIM
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid arrays for raw NPZ key {key!r}: {exc}") from exc
+            X[index] = feature
+            y[index] = target
+            elements.append(element)
+            material_ids.append(material_id)
+            sites.append(site)
+    finally:
+        if isinstance(feature_archive, np.lib.npyio.NpzFile):
+            feature_archive.close()
+        if isinstance(spectral_archive, np.lib.npyio.NpzFile):
+            spectral_archive.close()
+
+    material_splits = _assign_preparation_splits(Counter(material_ids))
+    split_codes = np.asarray(
+        [material_splits[material_id] for material_id in material_ids], dtype=np.int8
+    )
+    material_to_splits: dict[str, set[int]] = {}
+    for material_id, split_code in zip(material_ids, split_codes):
+        material_to_splits.setdefault(material_id, set()).add(int(split_code))
+    if any(len(splits) != 1 for splits in material_to_splits.values()):
+        raise ValueError("Preparation split invariant failed: a material crosses splits")
+    split_counts_array = np.bincount(split_codes.astype(np.int64), minlength=3)
+    if np.any(split_counts_array == 0):
+        raise ValueError(f"Preparation produced an empty split: {split_counts_array.tolist()}")
+
+    split_names = ("train", "val", "test")
+    split_counts = {
+        split_name: int(split_counts_array[index])
+        for index, split_name in enumerate(split_names)
+    }
+    source_paths = {
+        "feature_npz": str(feature_path.resolve()),
+        "spectral_npz": str(spectral_path.resolve()),
+    }
+    metadata: dict[str, Any] = {
+        "input_paths": source_paths,
+        "row_count": int(len(X)),
+        "feature_dim": int(X.shape[1]),
+        "target_dim": int(y.shape[1]),
+        "dimensions": {"features": int(X.shape[1]), "targets": int(y.shape[1])},
+        "seed": SEED,
+        "split_fractions": {"train": 0.8, "val": 0.1, "test": 0.1},
+        "split_counts": split_counts,
+        "elements": sorted(set(elements)),
+        "split_code_mapping": {"train": 0, "val": 1, "test": 2},
+        "created_at": datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z"),
+    }
+
+    try:
+        data_dir.parent.mkdir(parents=True, exist_ok=True)
+        temporary_dir = Path(
+            tempfile.mkdtemp(prefix=f".{data_dir.name}.tmp-", dir=str(data_dir.parent))
+        )
+        try:
+            _write_prepared_outputs(
+                temporary_dir, X, y, elements, material_ids, sites, split_codes, metadata
+            )
+            if os.path.lexists(data_dir):
+                raise FileExistsError(
+                    f"Prepared data path appeared during preparation, refusing to overwrite: {data_dir}"
+                )
+            os.rename(temporary_dir, data_dir)
+        except FileExistsError:
+            if temporary_dir.exists():
+                shutil.rmtree(temporary_dir)
+            raise
+        except Exception as exc:
+            if temporary_dir.exists():
+                shutil.rmtree(temporary_dir)
+            raise OSError(f"Could not write prepared data to {data_dir}: {exc}") from exc
+    except FileExistsError:
+        raise
+    except OSError as exc:
+        raise OSError(f"Could not create prepared data at {data_dir}: {exc}") from exc
+    return metadata
+
+
 def load_and_validate_dataset(data_dir: Path):
     """Load arrays and enforce the notebook's data invariants."""
     if not data_dir.is_dir():
         raise FileNotFoundError(f"Prepared AnionXAS directory does not exist: {data_dir}")
+    required_files = (
+        "X.npy",
+        "y.npy",
+        "elements.npy",
+        "material_ids.npy",
+        "sites.npy",
+        "split_codes.npy",
+        "metadata.json",
+    )
+    missing_files = [name for name in required_files if not (data_dir / name).is_file()]
+    if missing_files:
+        raise ValueError(
+            f"Prepared AnionXAS directory is incomplete: missing {missing_files!r} in {data_dir}"
+        )
 
     X = np.load(data_dir / "X.npy", allow_pickle=False)
     y = np.load(data_dir / "y.npy", allow_pickle=False)
@@ -732,6 +1029,15 @@ def main() -> int:
     )
     if not args.run_name:
         raise ValueError("--run-name must not be empty")
+    if not data_dir.exists():
+        print(
+            f"Prepared data directory does not exist. Preparing it from raw NPZ files: {data_dir}"
+        )
+        prepare_anionxas_data(
+            args.feature_npz.expanduser(), args.spectral_npz.expanduser(), data_dir
+        )
+    elif not data_dir.is_dir():
+        raise ValueError(f"Prepared data path exists but is not a directory: {data_dir}")
 
     (
         X,
