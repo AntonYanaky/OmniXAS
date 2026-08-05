@@ -1,24 +1,18 @@
 #!/usr/bin/env python3
-"""Train and evaluate AnionXAS UniversalXAS heads.
-
-On the first run, the script prepares the material-level training arrays from
-raw feature and spectral NPZ archives. Existing prepared data is reused.
-Example: ``python tutorial_omnixas/train_anionxas_universal.py --gpu 0``
-"""
+"""Train and evaluate balanced AnionXAS UniversalXAS heads."""
 
 from __future__ import annotations
 
 import argparse
-import ast
+import csv
 from collections import Counter
-from datetime import datetime, timezone
+from dataclasses import dataclass
+import hashlib
 import json
-import math
 import os
 from pathlib import Path
 import shutil
 import sys
-import tempfile
 from typing import Any
 
 # Set the device before importing torch or Lightning.
@@ -27,1113 +21,691 @@ _gpu_parser.add_argument("--gpu", default=None)
 _gpu_args, _ = _gpu_parser.parse_known_args()
 if _gpu_args.gpu is not None:
     os.environ["CUDA_VISIBLE_DEVICES"] = _gpu_args.gpu
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
 import torch
 from lightning import Trainer
 from lightning.pytorch import seed_everything
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
-from lightning.pytorch.loggers import CSVLogger
 from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 
 from omnixas.model.training import PlModule
 from omnixas.model.xasblock import XASBlock
+from scripts.prepare_anionxas_universal import prepare_dataset
 
 INPUT_DIM = 64
 OUTPUT_DIM = 200
 HIDDEN_DIMS = [500, 500, 550]
 SEED = 42
-DEFAULT_FEATURE_NPZ = (
-    Path.home()
-    / "data"
-    / "anionxas_drive"
-    / "drive-download-20260804T124325Z-1-001"
-    / "final_feature_data.npz"
-)
-DEFAULT_SPECTRAL_NPZ = (
-    Path.home()
-    / "data"
-    / "anionxas_drive"
-    / "drive-download-20260804T124325Z-1-001"
-    / "final_spectral_data.npz"
-)
-DEFAULT_RUN_NAME = "anionxas_universal_first_benchmark"
-DEFAULT_TUNED_ELEMENTS = ["Ti", "V", "Cr", "Mn", "Fe", "Co", "Ni", "Cu"]
-TUNED_SETTINGS = [
-    {
-        "name": "e2e_head_hparams",
-        "lr": 7e-4,
-        "dropout": 0.25,
-        "max_epochs": 300,
-        "patience": 30,
-        "scheduler": "cosine",
-        "cosine_t": 300,
-        "batch_size": 32,
-    },
-    {
-        "name": "cosT500_lr3e-4_do0p1",
-        "lr": 3e-4,
-        "dropout": 0.1,
-        "max_epochs": 1000,
-        "patience": 25,
-        "scheduler": "cosine",
-        "cosine_t": 500,
-        "batch_size": 32,
-    },
-]
-UNIVERSAL_HPARAMS = {**TUNED_SETTINGS[0], "monitor": "val_median_mse"}
-
+HEAD_OBJECTIVE = "balanced_relative_mse"
 OMNIXAS_ELEMENTS = ["Ti", "V", "Cr", "Mn", "Fe", "Co", "Ni", "Cu"]
-PAPER_UNIVERSAL_TEST_ETA = {
-    "Ti": 4.19,
-    "V": 5.19,
-    "Cr": 7.13,
-    "Mn": 13.15,
-    "Fe": 6.04,
-    "Co": 9.58,
-    "Ni": 6.43,
-    "Cu": 2.75,
-}
-PAPER_TUNED_TEST_ETA = {
-    "Ti": 7.63,
-    "V": 9.22,
-    "Cr": 10.44,
-    "Mn": 29.81,
-    "Fe": 8.98,
-    "Co": 19.83,
-    "Ni": 11.21,
-    "Cu": 4.81,
-}
-STORED_E2E_UNIVERSAL_TEST_ETA = {
-    "Ti": 10.2135,
-    "V": 10.4479,
-    "Cr": 15.0177,
-    "Mn": 23.2277,
-    "Fe": 13.5697,
-    "Co": 22.5677,
-    "Ni": 15.0454,
-    "Cu": 6.1412,
-}
-STORED_E2E_TUNED_TEST_ETA = {
-    "Ti": 10.6063,
-    "V": 11.1439,
-    "Cr": 17.3720,
-    "Mn": 30.5619,
-    "Fe": 14.2878,
-    "Co": 25.1017,
-    "Ni": 15.2779,
-    "Cu": 6.7511,
-}
+SCOPE_NAMES = {"all": "All_elements", "omnixas8": "OmniXAS_8"}
+DATA_FILES = (
+    "X.npy", "y.npy", "elements.npy", "material_ids.npy", "sites.npy",
+    "split_codes.npy", "metadata.json"
+)
+DEFAULT_DATA_DIR = Path.home() / "data" / "anionxas_drive" / "drive-download-20260804T124325Z-1-001"
+DEFAULT_FEATURE_NPZ = DEFAULT_DATA_DIR / "final_feature_data.npz"
+DEFAULT_SPECTRAL_NPZ = DEFAULT_DATA_DIR / "final_spectral_data.npz"
+DEFAULT_RUN_NAME = "anionxas_universal_first_benchmark"
+DEFAULT_TUNED_ELEMENTS = OMNIXAS_ELEMENTS.copy()
+TUNED_SETTINGS = [
+    {"name": "e2e_head_hparams", "lr": 7e-4, "dropout": 0.25, "max_epochs": 300,
+     "patience": 30, "scheduler": "cosine", "cosine_t": 300, "batch_size": 32},
+    {"name": "cosT500_lr3e-4_do0p1", "lr": 3e-4, "dropout": 0.1, "max_epochs": 1000,
+     "patience": 25, "scheduler": "cosine", "cosine_t": 500, "batch_size": 32},
+]
+UNIVERSAL_HPARAMS = {**TUNED_SETTINGS[0], "monitor": "val_balanced_rel_mse"}
+CANDIDATE_COLUMNS = [
+    "element", "setting", "checkpoint", "val_eta", "val_median_mse", "n_train", "n_val"
+]
+UNIVERSAL_COLUMNS = [
+    "element", "n_train", "n_val", "n_test", "val_eta", "test_eta",
+    "val_median_mse", "test_median_mse"
+]
+TUNED_COLUMNS = [
+    "element", "setting", "checkpoint", "n_train", "n_val", "n_test",
+    "val_eta", "test_eta", "val_median_mse", "test_median_mse"
+]
 
 
-def parse_args() -> argparse.Namespace:
-    """Parse command-line options."""
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--data-dir",
-        default=None,
-        help=(
-            "Prepared AnionXAS directory. Uses ANIONXAS_UNIVERSAL_DATA_DIR "
-            "or output/anionxas_universal_prepared. Missing data is prepared "
-            "from the raw NPZ options."
-        ),
-    )
-    parser.add_argument(
-        "--feature-npz",
-        type=Path,
-        default=DEFAULT_FEATURE_NPZ,
-        help="Raw feature NPZ used when the prepared data directory is missing.",
-    )
-    parser.add_argument(
-        "--spectral-npz",
-        type=Path,
-        default=DEFAULT_SPECTRAL_NPZ,
-        help="Raw spectral NPZ used when the prepared data directory is missing.",
-    )
-    parser.add_argument(
-        "--training-root",
-        default=None,
-        help=(
-            "Training output root. Uses ANIONXAS_TRAINING_ROOT or "
-            "output/training/anionxasUniversal."
-        ),
-    )
-    parser.add_argument("--run-name", default=DEFAULT_RUN_NAME, help="Name of this training run.")
-    parser.add_argument(
-        "--skip-universal",
-        action="store_true",
-        help="Do not train UniversalXAS. Reuse its expected existing checkpoint.",
-    )
-    parser.add_argument(
-        "--run-tuned",
-        action="store_true",
-        help="Train or reuse the optional tuned UniversalXAS heads.",
-    )
-    parser.add_argument(
-        "--force-retrain",
-        action="store_true",
-        help="Ignore existing best checkpoints and retrain requested heads.",
-    )
-    parser.add_argument(
-        "--tuned-elements",
-        nargs="+",
-        default=DEFAULT_TUNED_ELEMENTS,
-        metavar="ELEMENT",
-        help="Tuned head elements, or exactly one 'all' to use every dataset element.",
-    )
-    parser.add_argument(
-        "--gpu",
-        default=None,
-        help="CUDA_VISIBLE_DEVICES value. If omitted, Lightning selects the device.",
-    )
-    parser.add_argument(
-        "--validate-only",
-        action="store_true",
-        help="Validate and summarize data, then skip outputs and checkpoint work.",
-    )
-    return parser.parse_args()
+@dataclass(frozen=True)
+class Dataset:
+    X: np.ndarray
+    y: np.ndarray
+    elements: np.ndarray
+    material_ids: np.ndarray
+    sites: np.ndarray
+    split_codes: np.ndarray
+    metadata: dict[str, Any]
+    names: list[str]
 
 
-def resolve_path(value: str | None, environment_name: str, fallback: Path) -> Path:
-    """Resolve a CLI path, environment path, or notebook-compatible fallback."""
-    raw_value = value if value is not None else os.environ.get(environment_name, fallback)
-    return Path(raw_value).expanduser().resolve()
-
-
-def _parse_npz_key(key: str) -> tuple[str, str, int]:
-    """Parse one raw archive key without executing arbitrary code."""
-    try:
-        parsed = ast.literal_eval(key)
-    except (SyntaxError, ValueError, TypeError) as exc:
-        raise ValueError(f"Raw NPZ key {key!r} is not a valid tuple literal") from exc
-    if not isinstance(parsed, tuple) or len(parsed) != 3:
-        raise ValueError(
-            f"Raw NPZ key {key!r} must be exactly (element, material_id, site)"
-        )
-    element, material_id, raw_site = parsed
-    if not isinstance(element, str):
-        raise ValueError(f"Raw NPZ key {key!r} element must be a string")
-    if not isinstance(material_id, str):
-        raise ValueError(f"Raw NPZ key {key!r} material_id must be a string")
-    if isinstance(raw_site, bool):
-        raise ValueError(f"Raw NPZ key {key!r} site must not be boolean")
-    if isinstance(raw_site, float) and (
-        not math.isfinite(raw_site) or not raw_site.is_integer()
-    ):
-        raise ValueError(f"Raw NPZ key {key!r} site must be an integer")
-    try:
-        site = int(raw_site)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"Raw NPZ key {key!r} site must be int-compatible") from exc
-    if site < np.iinfo(np.int64).min or site > np.iinfo(np.int64).max:
-        raise ValueError(f"Raw NPZ key {key!r} site is outside the int64 range")
-    return element, material_id, site
-
-
-def _as_float32_vector(value: Any, label: str, expected_dim: int) -> np.ndarray:
-    array = np.asarray(value)
-    if array.ndim != 1 or array.shape[0] != expected_dim:
-        raise ValueError(
-            f"{label} must have shape ({expected_dim},); got {array.shape}"
-        )
-    if array.dtype.kind not in "iuf":
-        raise ValueError(f"{label} must have a real numeric dtype; got {array.dtype}")
-    try:
-        with np.errstate(over="ignore", invalid="ignore"):
-            converted = np.asarray(array, dtype=np.float32)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"{label} could not be converted to float32") from exc
-    if not np.isfinite(converted).all():
-        raise ValueError(f"{label} contains non-finite values or overflows float32")
-    return converted
-
-
-def _open_raw_npz(path: Path, label: str) -> np.lib.npyio.NpzFile:
-    if not path.exists():
-        raise FileNotFoundError(f"{label} does not exist: {path}")
-    if not path.is_file():
-        raise FileNotFoundError(f"{label} is not a file: {path}")
-    try:
-        archive = np.load(path, allow_pickle=False)
-    except Exception as exc:
-        raise ValueError(f"Could not load {label} {path}: {exc}") from exc
-    if not isinstance(archive, np.lib.npyio.NpzFile):
-        raise ValueError(f"{label} is not an NPZ archive: {path}")
-    return archive
-
-
-def _choose_preparation_split(
-    candidates: list[int], deficits: np.ndarray, current: np.ndarray, targets: np.ndarray
-) -> int:
-    if any(deficits[split] > 0 for split in candidates):
-        return max(candidates, key=lambda split: deficits[split])
-
-    def ratio(split: int) -> float:
-        target = targets[split]
-        return math.inf if target <= 0 else current[split] / target
-
-    return min(candidates, key=ratio)
-
-
-def _assign_preparation_splits(material_counts: Counter[str]) -> dict[str, int]:
-    """Assign whole materials with the frozen seed-42 80/10/10 policy."""
-    if len(material_counts) < 3:
-        raise ValueError(
-            "At least three materials are required for nonempty train, val, and test splits"
-        )
-    materials = sorted(material_counts)
-    rng = np.random.default_rng(SEED)
-    shuffled = [materials[int(index)] for index in rng.permutation(len(materials))]
-    ordered = sorted(shuffled, key=lambda material: -material_counts[material])
-    targets = np.asarray((0.8, 0.1, 0.1), dtype=np.float64) * sum(material_counts.values())
-    current = np.zeros(3, dtype=np.int64)
-    assignments: dict[str, int] = {}
-
-    for position, material in enumerate(ordered):
-        remaining = len(ordered) - position - 1
-        empty_splits = [split for split in range(3) if current[split] == 0]
-        candidates = empty_splits if empty_splits and remaining <= len(empty_splits) else [0, 1, 2]
-        split = _choose_preparation_split(candidates, targets - current, current, targets)
-        assignments[material] = split
-        current[split] += material_counts[material]
-
-    if np.any(current == 0):
-        raise ValueError(f"Preparation produced an empty split: {current.tolist()}")
-    return assignments
-
-
-def _write_prepared_outputs(
-    directory: Path,
-    X: np.ndarray,
-    y: np.ndarray,
-    elements: list[str],
-    material_ids: list[str],
-    sites: list[int],
-    split_codes: np.ndarray,
-    metadata: dict[str, Any],
-) -> None:
-    np.save(directory / "X.npy", X, allow_pickle=False)
-    np.save(directory / "y.npy", y, allow_pickle=False)
-    np.save(directory / "elements.npy", np.asarray(elements, dtype=str), allow_pickle=False)
-    np.save(
-        directory / "material_ids.npy",
-        np.asarray(material_ids, dtype=str),
-        allow_pickle=False,
-    )
-    np.save(directory / "sites.npy", np.asarray(sites, dtype=np.int64), allow_pickle=False)
-    np.save(directory / "split_codes.npy", split_codes.astype(np.int8, copy=False), allow_pickle=False)
-    with (directory / "metadata.json").open("w", encoding="utf-8") as handle:
-        json.dump(metadata, handle, indent=2, sort_keys=True, allow_nan=False)
-        handle.write("\n")
-
-
-def prepare_anionxas_data(
-    feature_npz: Path, spectral_npz: Path, data_dir: Path
-) -> dict[str, Any]:
-    """Prepare the seven arrays required by this trainer in one atomic operation."""
-    data_dir = Path(data_dir).expanduser()
-    if os.path.lexists(data_dir):
-        raise FileExistsError(
-            f"Prepared data path already exists, refusing to overwrite: {data_dir}"
-        )
-    feature_path = Path(feature_npz).expanduser()
-    spectral_path = Path(spectral_npz).expanduser()
-    feature_archive = None
-    spectral_archive = None
-    try:
-        feature_archive = _open_raw_npz(feature_path, "Feature NPZ")
-        spectral_archive = _open_raw_npz(spectral_path, "Spectral NPZ")
-        feature_keys = set(feature_archive.files)
-        spectral_keys = set(spectral_archive.files)
-        if feature_keys != spectral_keys:
-            raise ValueError(
-                "Feature and spectral NPZ key sets differ: "
-                f"missing from spectral={sorted(feature_keys - spectral_keys)!r}, "
-                f"missing from feature={sorted(spectral_keys - feature_keys)!r}"
-            )
-        if not feature_keys:
-            raise ValueError("Feature and spectral NPZ archives contain no arrays")
-
-        records = [(*_parse_npz_key(key), key) for key in feature_keys]
-        records.sort(key=lambda record: (record[0], record[1], record[2], record[3]))
-        X = np.empty((len(records), INPUT_DIM), dtype=np.float32)
-        y = np.empty((len(records), OUTPUT_DIM), dtype=np.float32)
-        elements: list[str] = []
-        material_ids: list[str] = []
-        sites: list[int] = []
-        for index, (element, material_id, site, key) in enumerate(records):
-            try:
-                feature = _as_float32_vector(
-                    feature_archive[key], f"feature array for key {key!r}", INPUT_DIM
-                )
-                target = _as_float32_vector(
-                    spectral_archive[key], f"spectral array for key {key!r}", OUTPUT_DIM
-                )
-            except (KeyError, TypeError, ValueError) as exc:
-                raise ValueError(f"Invalid arrays for raw NPZ key {key!r}: {exc}") from exc
-            X[index] = feature
-            y[index] = target
-            elements.append(element)
-            material_ids.append(material_id)
-            sites.append(site)
-    finally:
-        if isinstance(feature_archive, np.lib.npyio.NpzFile):
-            feature_archive.close()
-        if isinstance(spectral_archive, np.lib.npyio.NpzFile):
-            spectral_archive.close()
-
-    material_splits = _assign_preparation_splits(Counter(material_ids))
-    split_codes = np.asarray(
-        [material_splits[material_id] for material_id in material_ids], dtype=np.int8
-    )
-    material_to_splits: dict[str, set[int]] = {}
-    for material_id, split_code in zip(material_ids, split_codes):
-        material_to_splits.setdefault(material_id, set()).add(int(split_code))
-    if any(len(splits) != 1 for splits in material_to_splits.values()):
-        raise ValueError("Preparation split invariant failed: a material crosses splits")
-    split_counts_array = np.bincount(split_codes.astype(np.int64), minlength=3)
-    if np.any(split_counts_array == 0):
-        raise ValueError(f"Preparation produced an empty split: {split_counts_array.tolist()}")
-
-    split_names = ("train", "val", "test")
-    split_counts = {
-        split_name: int(split_counts_array[index])
-        for index, split_name in enumerate(split_names)
-    }
-    source_paths = {
-        "feature_npz": str(feature_path.resolve()),
-        "spectral_npz": str(spectral_path.resolve()),
-    }
-    metadata: dict[str, Any] = {
-        "input_paths": source_paths,
-        "row_count": int(len(X)),
-        "feature_dim": int(X.shape[1]),
-        "target_dim": int(y.shape[1]),
-        "dimensions": {"features": int(X.shape[1]), "targets": int(y.shape[1])},
-        "seed": SEED,
-        "split_fractions": {"train": 0.8, "val": 0.1, "test": 0.1},
-        "split_counts": split_counts,
-        "elements": sorted(set(elements)),
-        "split_code_mapping": {"train": 0, "val": 1, "test": 2},
-        "created_at": datetime.now(timezone.utc)
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z"),
-    }
-
-    try:
-        data_dir.parent.mkdir(parents=True, exist_ok=True)
-        temporary_dir = Path(
-            tempfile.mkdtemp(prefix=f".{data_dir.name}.tmp-", dir=str(data_dir.parent))
-        )
-        try:
-            _write_prepared_outputs(
-                temporary_dir, X, y, elements, material_ids, sites, split_codes, metadata
-            )
-            if os.path.lexists(data_dir):
-                raise FileExistsError(
-                    f"Prepared data path appeared during preparation, refusing to overwrite: {data_dir}"
-                )
-            os.rename(temporary_dir, data_dir)
-        except FileExistsError:
-            if temporary_dir.exists():
-                shutil.rmtree(temporary_dir)
-            raise
-        except Exception as exc:
-            if temporary_dir.exists():
-                shutil.rmtree(temporary_dir)
-            raise OSError(f"Could not write prepared data to {data_dir}: {exc}") from exc
-    except FileExistsError:
-        raise
-    except OSError as exc:
-        raise OSError(f"Could not create prepared data at {data_dir}: {exc}") from exc
-    return metadata
-
-
-def load_and_validate_dataset(data_dir: Path):
-    """Load arrays and enforce the notebook's data invariants."""
+def load_dataset(data_dir: Path) -> Dataset:
     if not data_dir.is_dir():
         raise FileNotFoundError(f"Prepared AnionXAS directory does not exist: {data_dir}")
-    required_files = (
-        "X.npy",
-        "y.npy",
-        "elements.npy",
-        "material_ids.npy",
-        "sites.npy",
-        "split_codes.npy",
-        "metadata.json",
-    )
-    missing_files = [name for name in required_files if not (data_dir / name).is_file()]
-    if missing_files:
-        raise ValueError(
-            f"Prepared AnionXAS directory is incomplete: missing {missing_files!r} in {data_dir}"
-        )
-
-    X = np.load(data_dir / "X.npy", allow_pickle=False)
-    y = np.load(data_dir / "y.npy", allow_pickle=False)
-    elements = np.load(data_dir / "elements.npy", allow_pickle=False).astype(str)
-    material_ids = np.load(data_dir / "material_ids.npy", allow_pickle=False).astype(str)
-    sites = np.load(data_dir / "sites.npy", allow_pickle=False)
-    split_codes = np.load(data_dir / "split_codes.npy", allow_pickle=False)
-    with (data_dir / "metadata.json").open(encoding="utf-8") as handle:
-        metadata = json.load(handle)
+    missing = [name for name in DATA_FILES if not (data_dir / name).is_file()]
+    if missing:
+        raise ValueError(f"Prepared data is incomplete. Missing {missing!r} in {data_dir}")
+    X, y, elements, material_ids, sites, split_codes = [
+        np.load(data_dir / name, allow_pickle=False) for name in DATA_FILES[:6]
+    ]
+    elements, material_ids = elements.astype(str), material_ids.astype(str)
+    try:
+        metadata = json.loads((data_dir / "metadata.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Could not read prepared metadata: {data_dir / 'metadata.json'}") from exc
     if not isinstance(metadata, dict):
         raise ValueError("metadata.json must contain a JSON object")
-
-    if X.ndim != 2 or y.ndim != 2:
-        raise ValueError(f"X and y must be two-dimensional; got {X.shape=} and {y.shape=}")
-    if X.shape[0] != y.shape[0]:
-        raise ValueError(f"X and y row counts differ: {X.shape[0]} != {y.shape[0]}")
-    if X.shape[1] != INPUT_DIM or y.shape[1] != OUTPUT_DIM:
+    if X.ndim != 2 or y.ndim != 2 or X.shape[1:] != (INPUT_DIM,) or y.shape[1:] != (OUTPUT_DIM,):
         raise ValueError(
-            f"Expected X.shape[1]={INPUT_DIM} and y.shape[1]={OUTPUT_DIM}; "
-            f"got {X.shape[1]=}, {y.shape[1]=}"
+            f"Expected X shape (n, {INPUT_DIM}) and y shape (n, {OUTPUT_DIM}), "
+            f"got {X.shape} and {y.shape}"
         )
-    if X.shape[0] == 0:
-        raise ValueError("The prepared dataset must contain at least one row")
-    if split_codes.ndim != 1 or not np.issubdtype(split_codes.dtype, np.integer):
-        raise ValueError("split_codes must be a one-dimensional integer array")
-    for name, values in (
-        ("elements", elements),
-        ("material_ids", material_ids),
-        ("sites", sites),
-        ("split_codes", split_codes),
+    n = len(X)
+    if not n or len(y) != n:
+        raise ValueError(f"X and y must have the same non-zero row count, got {n} and {len(y)}")
+    for name, values in zip(("elements", "material_ids", "sites"), (elements, material_ids, sites)):
+        if values.ndim != 1 or len(values) != n:
+            raise ValueError(f"{name} must be one-dimensional and aligned with X")
+    if (
+        split_codes.ndim != 1
+        or len(split_codes) != n
+        or not np.issubdtype(split_codes.dtype, np.integer)
     ):
-        values = np.asarray(values)
-        if values.ndim != 1 or len(values) != len(X):
-            raise ValueError(f"{name} has {len(values)} rows; X has {len(X)}")
-    if not np.isin(split_codes, [0, 1, 2]).all():
+        raise ValueError("split_codes must be an aligned one-dimensional integer array")
+    if not np.isin(split_codes, (0, 1, 2)).all():
         raise ValueError("split_codes must contain only 0 (train), 1 (val), and 2 (test)")
-    if not np.isfinite(X).all() or not np.isfinite(y).all():
-        raise ValueError("X and y must contain only finite values")
-
-    material_splits = {}
-    for material_id, split_code in zip(material_ids, split_codes):
-        material_splits.setdefault(material_id, set()).add(int(split_code))
-    if any(len(codes) != 1 for codes in material_splits.values()):
-        raise ValueError("Material-level split invariant failed: one material occurs in multiple splits")
-
-    dataset_elements = sorted(np.unique(elements).tolist())
-    split_counts = pd.crosstab(
-        pd.Series(elements, name="element"), pd.Series(split_codes, name="split_code")
-    ).reindex(index=dataset_elements, columns=[0, 1, 2], fill_value=0)
-    split_counts.columns = ["train", "val", "test"]
-    if (split_counts == 0).any().any():
-        raise ValueError("Every dataset element needs at least one train, validation, and test row")
-    return X, y, elements, material_ids, sites, split_codes, metadata, dataset_elements, split_counts
-
-
-def print_dataset_summary(
-    data_dir: Path,
-    X: np.ndarray,
-    y: np.ndarray,
-    material_ids: np.ndarray,
-    metadata: dict[str, Any],
-    split_codes: np.ndarray,
-    dataset_elements: list[str],
-    split_counts: pd.DataFrame,
-) -> None:
-    """Print the notebook summary in terminal-readable form."""
-    summary = pd.DataFrame(
-        {
-            "rows": [len(X)],
-            "elements": [len(dataset_elements)],
-            "materials": [len(np.unique(material_ids))],
-            "feature_dim": [X.shape[1]],
-            "spectrum_dim": [y.shape[1]],
-        }
-    )
-    print(f"Repository: {REPO_ROOT}")
-    print(f"Data:       {data_dir}")
-    print(summary.to_string(index=False))
-    print("Per-element split counts:")
-    print(split_counts.to_string())
-    print(f"Metadata keys: {sorted(metadata)}")
-    print(f"Split totals: {Counter(split_codes.tolist())}")
+    if not np.issubdtype(X.dtype, np.number) or not np.issubdtype(y.dtype, np.number):
+        raise ValueError("X and y must have numeric dtypes")
+    if not np.issubdtype(sites.dtype, np.integer):
+        raise ValueError("sites must have an integer dtype")
+    if not np.isfinite(X).all() or not np.isfinite(y).all() or not np.isfinite(sites).all():
+        raise ValueError("X, y, and sites must contain only finite values")
+    material_splits: dict[str, set[int]] = {}
+    for material, split in zip(material_ids, split_codes):
+        material_splits.setdefault(material, set()).add(int(split))
+    if any(len(splits) != 1 for splits in material_splits.values()):
+        raise ValueError(
+            "Material-level split invariant failed: one material occurs in multiple splits"
+        )
+    names = sorted(np.unique(elements).tolist())
+    missing = [
+        element for element in names
+        if any(not np.any((elements == element) & (split_codes == split)) for split in (0, 1, 2))
+    ]
+    if missing:
+        raise ValueError(
+            "Every dataset element needs train, validation, and test rows. "
+            f"Missing rows for {missing!r}"
+        )
+    return Dataset(X, y, elements, material_ids, sites, split_codes, metadata, names)
 
 
-def make_loader(
-    X: np.ndarray,
-    y: np.ndarray,
-    mask: np.ndarray,
-    batch_size: int,
-    *,
-    sampler=None,
-    shuffle: bool = False,
-    training: bool = False,
-) -> DataLoader:
-    """Create a tensor loader with a BatchNorm-safe training batch size."""
-    indices = np.flatnonzero(mask)
-    if training and len(indices) < 2:
-        raise ValueError(f"A training selection needs at least two rows; got {len(indices)}")
-    batch_size = int(batch_size)
-    if training:
-        batch_size = min(batch_size, len(indices))
-        # BatchNorm1d cannot process a one-sample final batch.
-        while len(indices) % batch_size == 1 and batch_size > 2:
-            batch_size -= 1
-    dataset = TensorDataset(
-        torch.as_tensor(X[indices], dtype=torch.float32),
-        torch.as_tensor(y[indices], dtype=torch.float32),
-    )
-    loader_kwargs = {"batch_size": batch_size, "num_workers": 0}
-    if sampler is not None:
-        loader_kwargs["sampler"] = sampler
-    else:
-        loader_kwargs["shuffle"] = shuffle
-    return DataLoader(dataset, **loader_kwargs)
+def mask(data: Dataset, element: str, split: int) -> np.ndarray:
+    return (data.elements == element) & (data.split_codes == split)
 
 
-def make_module(hparams: dict[str, Any]) -> PlModule:
-    """Build the notebook's XASBlock and PlModule."""
-    if hparams["scheduler"] != "cosine":
-        raise ValueError(f"Unsupported scheduler: {hparams['scheduler']!r}; expected 'cosine'")
-    if hparams["cosine_t"] < 1:
-        raise ValueError(f"cosine_t must be positive, got {hparams['cosine_t']}")
+def baselines(data: Dataset, selected: list[str]) -> tuple[np.ndarray, np.ndarray]:
+    if not selected:
+        raise ValueError("At least one element is required for baseline calculation")
+    unknown = sorted(set(selected) - set(data.names))
+    if unknown:
+        raise ValueError(f"Unknown elements in baseline calculation: {unknown!r}")
+    if len(set(selected)) != len(selected):
+        raise ValueError("Baseline elements must be unique")
+    train_mse, val_mse = [], []
+    for element in selected:
+        train = data.y[mask(data, element, 0)].astype(np.float64)
+        validation = data.y[mask(data, element, 1)].astype(np.float64)
+        mean = train.mean(axis=0)
+        train_mse.append(float(np.median(np.mean((train - mean) ** 2, axis=1))))
+        val_mse.append(float(np.median(np.mean((validation - mean) ** 2, axis=1))))
+    result = tuple(np.asarray(values, dtype=np.float32) for values in (train_mse, val_mse))
+    for label, values in zip(("Training", "Validation"), result):
+        if not np.isfinite(values).all() or (values <= 0).any():
+            raise ValueError(f"{label} baseline MSE must be finite and positive: {values}")
+    return result
+
+
+def balanced_relative_mse(
+    mse: torch.Tensor, element_indices: torch.Tensor, baselines: torch.Tensor
+) -> torch.Tensor:
+    if mse.ndim != 1 or element_indices.ndim != 1:
+        raise ValueError("MSE and element index tensors must be one-dimensional")
+    if not len(mse) or len(mse) != len(element_indices):
+        raise ValueError("MSE and element index tensors must be non-empty and aligned")
+    if baselines.ndim != 1 or not len(baselines):
+        raise ValueError("Relative-MSE baselines must be a non-empty one-dimensional tensor")
+    if not torch.isfinite(mse).all() or not torch.isfinite(baselines).all() or (baselines <= 0).any():
+        raise ValueError("Relative-MSE inputs must be finite, and baselines must be positive")
+    values = []
+    for index, baseline in enumerate(baselines.to(mse.device)):
+        selected = mse[element_indices == index]
+        if not len(selected):
+            raise ValueError(f"Validation has no rows for element index {index}")
+        values.append(torch.quantile(selected, 0.5) / baseline)
+    result = torch.stack(values).mean()
+    if not torch.isfinite(result):
+        raise ValueError("Balanced relative validation MSE is not finite")
+    return result
+
+
+class BalancedRelativeMSEModule(PlModule):
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        training_baselines: np.ndarray,
+        validation_baselines: np.ndarray,
+        **kwargs: Any,
+    ):
+        super().__init__(model, **kwargs)
+        train = torch.as_tensor(training_baselines, dtype=torch.float32)
+        validation = torch.as_tensor(validation_baselines, dtype=torch.float32)
+        if (train.ndim, validation.ndim) != (1, 1) or train.shape != validation.shape or not len(train):
+            raise ValueError("Training and validation baselines must be aligned one-dimensional arrays")
+        if (
+            not torch.isfinite(train).all()
+            or not torch.isfinite(validation).all()
+            or (train <= 0).any()
+            or (validation <= 0).any()
+        ):
+            raise ValueError("Training and validation baselines must be finite and positive")
+        self.register_buffer("training_baselines", train, persistent=False)
+        self.register_buffer("validation_baselines", validation, persistent=False)
+        self._val_mse: list[torch.Tensor] = []
+        self._val_elements: list[torch.Tensor] = []
+
+    def _indices(self, values: torch.Tensor) -> torch.Tensor:
+        values = values.long()
+        if (
+            values.ndim != 1
+            or not len(values)
+            or values.min() < 0
+            or values.max() >= len(self.training_baselines)
+        ):
+            raise ValueError("Batch contains invalid element indices")
+        return values
+
+    def _batch_mse(self, batch: Any) -> tuple[torch.Tensor, torch.Tensor]:
+        x, y, indices = batch
+        indices = self._indices(indices)
+        return torch.mean((y - self.model(x)) ** 2, dim=1), indices
+
+    def training_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
+        mse, indices = self._batch_mse(batch)
+        loss = (mse / self.training_baselines[indices]).mean()
+        self.log("train_loss", loss, on_step=False, on_epoch=True)
+        self.log("train_raw_mse", mse.mean(), on_step=False, on_epoch=True)
+        return loss
+
+    def on_validation_epoch_start(self) -> None:
+        self._val_mse, self._val_elements = [], []
+
+    def validation_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
+        mse, indices = self._batch_mse(batch)
+        self._val_mse.append(mse.detach())
+        self._val_elements.append(indices.detach())
+        self.log("val_loss", mse.mean(), on_step=False, on_epoch=True)
+        return mse.mean()
+
+    def on_validation_epoch_end(self) -> None:
+        if not self._val_mse:
+            raise ValueError("Validation produced no batches")
+        mse, indices = torch.cat(self._val_mse), torch.cat(self._val_elements)
+        self.log("val_median_mse", torch.quantile(mse, 0.5), on_step=False, on_epoch=True)
+        self.log(
+            "val_balanced_rel_mse",
+            balanced_relative_mse(mse, indices, self.validation_baselines),
+            on_step=False,
+            on_epoch=True,
+        )
+
+
+def checkpoint_state(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        raise FileNotFoundError(f"Checkpoint does not exist: {path}")
+    try:
+        try:
+            payload = torch.load(path, map_location="cpu", weights_only=False)
+        except TypeError:
+            payload = torch.load(path, map_location="cpu")
+    except Exception as exc:
+        raise ValueError(f"Could not load checkpoint: {path}") from exc
+    state = payload.get("state_dict") if isinstance(payload, dict) else None
+    if not isinstance(state, dict):
+        raise ValueError(f"Checkpoint has no state_dict: {path}")
+    return state
+
+
+def setting_name(hparams: dict[str, Any]) -> str:
+    return f"{hparams['name']}_{HEAD_OBJECTIVE}"
+
+
+def head_run_dir(run_dir: Path, family: str, scope: str, setting: str, element: str | None = None) -> Path:
+    path = run_dir / "heads" / family / scope
+    if element is not None:
+        path /= element
+    return path / "runs" / setting
+
+
+def source_manifest(universal: Path) -> dict[str, str]:
+    if not universal.is_file():
+        raise FileNotFoundError(f"Checkpoint does not exist: {universal}")
+    with universal.open("rb") as handle:
+        digest = hashlib.file_digest(handle, "sha256").hexdigest()
+    return {"universal_checkpoint": str(universal.resolve()), "universal_checkpoint_sha256": digest}
+
+
+def check_manifest(setting_dir: Path, universal: Path) -> None:
+    path = setting_dir / "source_universal.json"
+    try:
+        actual = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Tuned checkpoint provenance is missing: {path}") from exc
+    if actual != source_manifest(universal):
+        raise ValueError(f"Tuned checkpoint source does not match {universal}: {setting_dir}")
+
+
+def train_head(
+    data: Dataset,
+    selected: list[str],
+    hparams: dict[str, Any],
+    train_base: np.ndarray,
+    val_base: np.ndarray,
+    run_dir: Path,
+    force: bool = False,
+    source: Path | None = None,
+) -> Path:
+    """Reuse or train one balanced head, with optional UniversalXAS transfer."""
+    if hparams["scheduler"] != "cosine" or int(hparams["cosine_t"]) < 1:
+        raise ValueError("Only a positive cosine scheduler with a positive period is supported")
+    batch_size = int(hparams["batch_size"])
+    if batch_size < 2:
+        raise ValueError("Training batch size must be at least two for BatchNorm1d")
+    if not selected:
+        raise ValueError("At least one element is required for head training")
+    best = run_dir / "best.ckpt"
+    if best.exists() and not best.is_file() and not force:
+        raise ValueError(f"Checkpoint path is not a file: {best}")
+    if source is not None and best.is_file() and not force:
+        check_manifest(run_dir, source)
     XASBlock.DROPOUT = float(hparams["dropout"])
-    return PlModule(
-        XASBlock(INPUT_DIM, HIDDEN_DIMS, OUTPUT_DIM),
-        lr=float(hparams["lr"]),
-        lr_scheduler=torch.optim.lr_scheduler.CosineAnnealingLR,
+    module = BalancedRelativeMSEModule(
+        XASBlock(INPUT_DIM, HIDDEN_DIMS, OUTPUT_DIM), train_base, val_base,
+        lr=float(hparams["lr"]), lr_scheduler=torch.optim.lr_scheduler.CosineAnnealingLR,
         lr_scheduler_kwargs={"T_max": int(hparams["cosine_t"]), "eta_min": 1e-6},
         lr_scheduler_interval="epoch",
     )
-
-
-def checkpoint_state_dict(checkpoint: Path) -> dict[str, Any]:
-    """Load a Lightning state dictionary and fail on malformed checkpoints."""
-    checkpoint = Path(checkpoint)
-    if not checkpoint.is_file():
-        raise FileNotFoundError(f"Checkpoint does not exist: {checkpoint}")
-    try:
-        try:
-            payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
-        except TypeError:
-            payload = torch.load(checkpoint, map_location="cpu")
-    except Exception as exc:
-        raise ValueError(f"Could not load checkpoint: {checkpoint}") from exc
-    state_dict = payload.get("state_dict") if isinstance(payload, dict) else None
-    if not isinstance(state_dict, dict):
-        raise ValueError(f"Checkpoint has no state_dict: {checkpoint}")
-    return state_dict
-
-
-def fit_head(
-    module: PlModule,
-    train_loader: DataLoader,
-    val_loader: DataLoader,
-    run_dir: Path,
-    hparams: dict[str, Any],
-    *,
-    force_retrain: bool = False,
-    initial_checkpoint: Path | None = None,
-) -> Path:
-    """Reuse or train one head and return its stable best-checkpoint path."""
-    best_path = run_dir / "best.ckpt"
-    if force_retrain and run_dir.exists():
-        if not run_dir.is_dir():
-            raise ValueError(f"Training run path is not a directory: {run_dir}")
+    if best.is_file() and not force:
+        module.load_state_dict(checkpoint_state(best), strict=True)
+        return best
+    if run_dir.exists() and not run_dir.is_dir():
+        raise ValueError(f"Training run path is not a directory: {run_dir}")
+    if force and run_dir.exists():
         shutil.rmtree(run_dir)
+    elif run_dir.exists() and any(run_dir.iterdir()):
+        raise ValueError("Incomplete training run exists without a reusable best checkpoint: "
+                         f"{run_dir}. Use --force-retrain")
     run_dir.mkdir(parents=True, exist_ok=True)
-    if best_path.exists() and not force_retrain:
-        module.load_state_dict(checkpoint_state_dict(best_path), strict=True)
-        return best_path
-    if initial_checkpoint is not None:
-        module.load_state_dict(checkpoint_state_dict(initial_checkpoint), strict=True)
-    checkpoint_callback = ModelCheckpoint(
-        dirpath=str(run_dir),
-        filename="best",
-        monitor=hparams["monitor"],
-        mode="min",
-        save_top_k=1,
-        save_last=True,
-        auto_insert_metric_name=False,
+    scope = np.isin(data.elements, selected)
+    train_rows, val_rows = [np.flatnonzero(scope & (data.split_codes == s)) for s in (0, 1)]
+    if len(train_rows) < 2:
+        raise ValueError(f"Training selection needs at least two rows, got {len(train_rows)}")
+    if not len(val_rows):
+        raise ValueError("Validation selection is empty")
+    lookup = {element: index for index, element in enumerate(selected)}
+    indices = np.asarray([lookup.get(element, -1) for element in data.elements])
+    train_indices, val_indices = indices[train_rows], indices[val_rows]
+    if (train_indices < 0).any() or (val_indices < 0).any():
+        raise ValueError(
+            "Training or validation selection contains an element outside the selected head scope"
+        )
+    counts = np.bincount(train_indices, minlength=len(selected))
+    if (counts == 0).any():
+        missing = [selected[i] for i, count in enumerate(counts) if not count]
+        raise ValueError(f"Training selection has no rows for element(s): {missing!r}")
+    sampler = WeightedRandomSampler(
+        torch.as_tensor(1.0 / counts[train_indices], dtype=torch.double), len(train_rows),
+        replacement=True, generator=torch.Generator().manual_seed(SEED)
     )
-    early_stopping = EarlyStopping(
-        monitor=hparams["monitor"], mode="min", patience=int(hparams["patience"])
+
+    def tensor_dataset(rows: np.ndarray, indices: np.ndarray) -> TensorDataset:
+        return TensorDataset(
+            torch.as_tensor(data.X[rows], dtype=torch.float32),
+            torch.as_tensor(data.y[rows], dtype=torch.float32),
+            torch.as_tensor(indices, dtype=torch.long),
+        )
+
+    train_batch = min(batch_size, len(train_rows))
+    while train_batch > 2 and len(train_rows) % train_batch == 1:
+        train_batch -= 1
+    train_loader = DataLoader(
+        tensor_dataset(train_rows, train_indices), batch_size=train_batch,
+        sampler=sampler, drop_last=len(train_rows) % train_batch == 1, num_workers=0
     )
-    csv_logger = CSVLogger(save_dir=str(run_dir), name="csv_logs", version="0")
-    trainer = Trainer(
-        max_epochs=int(hparams["max_epochs"]),
-        accelerator="auto",
-        devices=1,
-        callbacks=[checkpoint_callback, early_stopping],
-        logger=csv_logger,
-        default_root_dir=str(run_dir),
+    val_loader = DataLoader(
+        tensor_dataset(val_rows, val_indices), batch_size=min(batch_size, len(val_rows)),
+        shuffle=False, num_workers=0
     )
-    trainer.fit(module, train_dataloaders=train_loader, val_dataloaders=val_loader)
-    if not checkpoint_callback.best_model_path:
+    if source is not None:
+        module.load_state_dict(checkpoint_state(source), strict=True)
+    checkpoint = ModelCheckpoint(
+        dirpath=str(run_dir), filename="best", monitor=hparams["monitor"], mode="min",
+        save_top_k=1, save_last=False, auto_insert_metric_name=False
+    )
+    Trainer(
+        max_epochs=int(hparams["max_epochs"]), accelerator="auto", devices=1,
+        callbacks=[
+            checkpoint,
+            EarlyStopping(
+                monitor=hparams["monitor"], mode="min", patience=int(hparams["patience"])
+            ),
+        ],
+        logger=False, default_root_dir=str(run_dir)
+    ).fit(module, train_dataloaders=train_loader, val_dataloaders=val_loader)
+    if not checkpoint.best_model_path:
         raise RuntimeError(f"No best checkpoint was written in {run_dir}")
-    produced_path = Path(checkpoint_callback.best_model_path)
-    if produced_path != best_path:
-        shutil.copy2(produced_path, best_path)
-    return best_path
+    produced = Path(checkpoint.best_model_path)
+    if produced.resolve() != best.resolve():
+        shutil.copy2(produced, best)
+    if source is not None:
+        (run_dir / "source_universal.json").write_text(
+            json.dumps(source_manifest(source), indent=2, sort_keys=True, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+    return best
 
 
-def predict_checkpoint(checkpoint: Path, features: np.ndarray, batch_size: int = 1024) -> np.ndarray:
-    """Predict from one checkpoint on CPU in deterministic batches."""
-    features = np.asarray(features, dtype=np.float32)
-    if features.ndim != 2 or features.shape[1] != INPUT_DIM:
-        raise ValueError(f"Prediction X must have shape (n, {INPUT_DIM}); got {features.shape}")
-    if len(features) == 0:
-        return np.empty((0, OUTPUT_DIM), dtype=np.float32)
+def predict(path: Path, X: np.ndarray) -> np.ndarray:
+    X = np.asarray(X, dtype=np.float32)
+    if X.ndim != 2 or X.shape[1] != INPUT_DIM:
+        raise ValueError(f"Prediction X must have shape (n, {INPUT_DIM}), got {X.shape}")
     XASBlock.DROPOUT = 0.0
     module = PlModule(XASBlock(INPUT_DIM, HIDDEN_DIMS, OUTPUT_DIM), lr=1e-4)
-    module.load_state_dict(checkpoint_state_dict(checkpoint), strict=True)
+    module.load_state_dict(checkpoint_state(path), strict=True)
     module.eval()
-    loader = DataLoader(torch.as_tensor(features), batch_size=batch_size, shuffle=False, num_workers=0)
-    predictions = []
+    outputs = []
     with torch.inference_mode():
-        for batch in loader:
-            predictions.append(module.model(batch).cpu().numpy())
-    prediction = np.concatenate(predictions, axis=0)
-    if prediction.shape != (len(features), OUTPUT_DIM) or not np.isfinite(prediction).all():
-        raise ValueError(f"Malformed checkpoint prediction shape or values: {prediction.shape}")
+        for batch in DataLoader(
+            torch.as_tensor(X, dtype=torch.float32),
+            batch_size=1024,
+            shuffle=False,
+            num_workers=0,
+        ):
+            outputs.append(module.model(batch).cpu().numpy())
+    prediction = np.concatenate(outputs) if outputs else np.empty((0, OUTPUT_DIM), dtype=np.float32)
+    if prediction.shape != (len(X), OUTPUT_DIM) or not np.isfinite(prediction).all():
+        raise ValueError(f"Malformed checkpoint prediction: {prediction.shape}")
     return prediction
 
 
-def eta_from_predictions(
-    y_train: np.ndarray, y_eval: np.ndarray, predictions: np.ndarray
-) -> tuple[float, float]:
-    """Return eta and model median per-spectrum MSE."""
-    y_train = np.asarray(y_train, dtype=np.float64)
-    y_eval = np.asarray(y_eval, dtype=np.float64)
+def eta(data: Dataset, element: str, split: int, predictions: np.ndarray) -> tuple[float, float]:
+    target = data.y[mask(data, element, split)].astype(np.float64)
+    train = data.y[mask(data, element, 0)].astype(np.float64)
     predictions = np.asarray(predictions, dtype=np.float64)
-    if len(y_train) == 0 or len(y_eval) == 0:
-        raise ValueError("eta requires non-empty train and evaluation targets")
-    if y_eval.shape != predictions.shape:
-        raise ValueError(f"Evaluation target and prediction shapes differ: {y_eval.shape} != {predictions.shape}")
-    train_mean = y_train.mean(axis=0)
-    baseline_mse = np.mean((y_eval - train_mean) ** 2, axis=1)
-    model_mse = np.mean((y_eval - predictions) ** 2, axis=1)
-    baseline_median = float(np.median(baseline_mse))
-    model_median = float(np.median(model_mse))
-    if not np.isfinite(model_median) or model_median <= 0:
-        raise ZeroDivisionError(
-            "Model median MSE must be finite and positive for eta; "
-            f"got {model_median}"
-        )
-    return baseline_median / model_median, model_median
+    if not len(train) or not len(target):
+        raise ValueError("eta requires non-empty training and evaluation targets")
+    if predictions.shape != target.shape:
+        raise ValueError("Evaluation target and prediction shapes differ: "
+                         f"{target.shape} != {predictions.shape}")
+    mean = train.mean(axis=0)
+    baseline = float(np.median(np.mean((target - mean) ** 2, axis=1)))
+    model_mse = float(np.median(np.mean((target - predictions) ** 2, axis=1)))
+    if not np.isfinite(baseline) or baseline <= 0:
+        raise ValueError(f"Baseline median MSE must be finite and positive, got {baseline}")
+    if not np.isfinite(model_mse) or model_mse <= 0:
+        raise ZeroDivisionError(f"Model median MSE must be finite and positive, got {model_mse}")
+    return baseline / model_mse, model_mse
 
 
-def mask_for_element(
-    element: str,
-    split_code: int,
-    elements: np.ndarray,
-    split_codes: np.ndarray,
-    dataset_elements: list[str],
-) -> np.ndarray:
-    if element not in dataset_elements:
-        raise ValueError(f"Unknown element: {element}")
-    return (elements == element) & (split_codes == split_code)
-
-
-def resolve_tuned_elements(requested: list[str], dataset_elements: list[str]) -> list[str]:
-    if not all(isinstance(element, str) for element in requested):
-        raise ValueError("--tuned-elements must contain element names as strings")
-    all_requested = any(element.strip().lower() == "all" for element in requested)
-    if all_requested:
-        if len(requested) != 1:
-            raise ValueError("--tuned-elements='all' cannot be mixed with named elements")
-        return list(dataset_elements)
-    unknown = sorted(set(requested) - set(dataset_elements))
-    if unknown:
-        raise ValueError(f"Unknown configured element name(s): {unknown}")
-    return list(requested)
-
-
-def universal_checkpoint_path(run_dir: Path) -> Path:
-    return run_dir / "heads" / "universalXAS" / "All_elements" / "runs" / "e2e_head_hparams" / "best.ckpt"
-
-
-def collect_tuned_checkpoints(
-    *,
-    run_dir: Path,
-    X: np.ndarray,
-    y: np.ndarray,
-    elements: np.ndarray,
-    split_codes: np.ndarray,
-    dataset_elements: list[str],
-    tuned_elements: list[str],
-    run_tuned: bool,
-    force_retrain: bool,
-    universal_checkpoint: Path | None,
-) -> dict[tuple[str, str], Path]:
-    """Train requested tuned heads or discover prior tuned heads."""
-    tuned_root = run_dir / "heads" / "tunedUniversalXAS"
-    tuned_checkpoints = {}
-    if run_tuned and universal_checkpoint is None:
-        raise FileNotFoundError("--run-tuned requires the universal best checkpoint")
-
-    for element in tuned_elements:
-        train_mask = mask_for_element(element, 0, elements, split_codes, dataset_elements)
-        val_mask = mask_for_element(element, 1, elements, split_codes, dataset_elements)
-        for setting in TUNED_SETTINGS:
-            setting_name = str(setting["name"])
-            setting_dir = tuned_root / element / "runs" / setting_name
-            checkpoint = setting_dir / "best.ckpt"
-            if checkpoint.exists() and not checkpoint.is_file():
-                raise ValueError(f"Tuned checkpoint path is not a file: {checkpoint}")
-            if run_tuned:
-                setting_hparams = {**setting, "monitor": "val_median_mse"}
-                tuned_module = make_module(setting_hparams)
-                tuned_train_loader = make_loader(
-                    X, y, train_mask, setting["batch_size"], shuffle=True, training=True
-                )
-                tuned_val_loader = make_loader(X, y, val_mask, setting["batch_size"])
-                checkpoint = fit_head(
-                    tuned_module,
-                    tuned_train_loader,
-                    tuned_val_loader,
-                    setting_dir,
-                    setting_hparams,
-                    force_retrain=force_retrain,
-                    initial_checkpoint=universal_checkpoint,
-                )
-            if checkpoint.is_file():
-                tuned_checkpoints[(element, setting_name)] = checkpoint
-
-    if not run_tuned:
-        # Discover prior runs for every valid dataset element, not only configured elements.
-        for checkpoint in sorted(tuned_root.glob("*/runs/*/best.ckpt")):
-            element = checkpoint.parents[2].name
-            if element not in dataset_elements:
-                raise ValueError(f"Found tuned checkpoint for unknown element: {checkpoint}")
-            tuned_checkpoints[(element, checkpoint.parent.name)] = checkpoint
-    return tuned_checkpoints
-
-
-def evaluate_and_save(
-    *,
-    run_dir: Path,
-    X: np.ndarray,
-    y: np.ndarray,
-    elements: np.ndarray,
-    split_codes: np.ndarray,
-    dataset_elements: list[str],
-    universal_checkpoint: Path | None,
-    tuned_checkpoints: dict[tuple[str, str], Path],
-) -> None:
-    """Evaluate checkpoints and write the notebook's four CSV and PNG outputs."""
-    tuned_validation_rows = []
-    for (element, setting_name), checkpoint in tuned_checkpoints.items():
-        element_train = mask_for_element(element, 0, elements, split_codes, dataset_elements)
-        element_val = mask_for_element(element, 1, elements, split_codes, dataset_elements)
-        val_eta, val_median_mse = eta_from_predictions(
-            y[element_train], y[element_val], predict_checkpoint(checkpoint, X[element_val])
-        )
-        tuned_validation_rows.append(
-            [
-                element,
-                setting_name,
-                str(checkpoint),
-                val_eta,
-                val_median_mse,
-                int(element_train.sum()),
-                int(element_val.sum()),
-            ]
-        )
-    tuned_validation_columns = [
-        "element",
-        "setting",
-        "checkpoint",
-        "val_eta",
-        "val_median_mse",
-        "n_train",
-        "n_val",
-    ]
-    tuned_validation_candidates = pd.DataFrame(
-        tuned_validation_rows, columns=tuned_validation_columns
-    )
-    tuned_validation_candidates.to_csv(run_dir / "tuned_validation_candidates.csv", index=False)
-    if tuned_validation_candidates.empty:
-        selected_tuned = tuned_validation_candidates.copy()
-        print("No tuned checkpoints were trained or found.")
-    else:
-        selected_tuned = (
-            tuned_validation_candidates.sort_values(
-                ["element", "val_eta"], ascending=[True, False]
-            )
-            .drop_duplicates("element", keep="first")
-            .reset_index(drop=True)
-        )
-        print("Selected tuned heads:")
-        print(selected_tuned.to_string(index=False))
-
-    universal_columns = [
-        "element",
-        "n_train",
-        "n_val",
-        "n_test",
-        "val_eta",
-        "test_eta",
-        "val_median_mse",
-        "test_median_mse",
-    ]
-    universal_rows = []
-    if universal_checkpoint is not None:
-        for element in dataset_elements:
-            element_train = mask_for_element(element, 0, elements, split_codes, dataset_elements)
-            element_val = mask_for_element(element, 1, elements, split_codes, dataset_elements)
-            element_test = mask_for_element(element, 2, elements, split_codes, dataset_elements)
-            val_eta, val_median_mse = eta_from_predictions(
-                y[element_train], y[element_val], predict_checkpoint(universal_checkpoint, X[element_val])
-            )
-            test_eta, test_median_mse = eta_from_predictions(
-                y[element_train], y[element_test], predict_checkpoint(universal_checkpoint, X[element_test])
-            )
-            universal_rows.append(
-                {
-                    "element": element,
-                    "n_train": int(element_train.sum()),
-                    "n_val": int(element_val.sum()),
-                    "n_test": int(element_test.sum()),
-                    "val_eta": val_eta,
-                    "test_eta": test_eta,
-                    "val_median_mse": val_median_mse,
-                    "test_median_mse": test_median_mse,
-                }
-            )
-    universal_eval = pd.DataFrame(universal_rows, columns=universal_columns).sort_values(
-        "element"
-    ).reset_index(drop=True)
-    universal_eval.to_csv(run_dir / "universal_eval_by_element.csv", index=False)
-    if universal_eval.empty:
-        print("No universal checkpoint is available for evaluation.")
-    else:
-        print("Universal evaluation:")
-        print(universal_eval.to_string(index=False))
-
-    tuned_columns = [
-        "element",
-        "setting",
-        "checkpoint",
-        "n_train",
-        "n_val",
-        "n_test",
-        "val_eta",
-        "test_eta",
-        "val_median_mse",
-        "test_median_mse",
-    ]
-    tuned_eval_rows = []
-    for record in selected_tuned.to_dict("records"):
-        element = record["element"]
-        element_train = mask_for_element(element, 0, elements, split_codes, dataset_elements)
-        element_test = mask_for_element(element, 2, elements, split_codes, dataset_elements)
-        test_eta, test_median_mse = eta_from_predictions(
-            y[element_train],
-            y[element_test],
-            predict_checkpoint(record["checkpoint"], X[element_test]),
-        )
-        tuned_eval_rows.append(
-            [
-                element,
-                record["setting"],
-                record["checkpoint"],
-                record["n_train"],
-                record["n_val"],
-                int(element_test.sum()),
-                record["val_eta"],
-                test_eta,
-                record["val_median_mse"],
-                test_median_mse,
-            ]
-        )
-    tuned_eval = pd.DataFrame(tuned_eval_rows, columns=tuned_columns).sort_values(
-        "element"
-    ).reset_index(drop=True)
-    tuned_eval.to_csv(run_dir / "tuned_eval_by_element.csv", index=False)
-    if not tuned_eval.empty:
-        print("Tuned evaluation:")
-        print(tuned_eval.to_string(index=False))
-
-    universal_values = universal_eval[["element", "val_eta", "test_eta"]].rename(
-        columns={
-            "val_eta": "notebook_universal_val_eta",
-            "test_eta": "notebook_universal_test_eta",
-        }
-    )
-    tuned_values = tuned_eval[["element", "val_eta", "test_eta"]].rename(
-        columns={
-            "val_eta": "notebook_tuned_val_eta",
-            "test_eta": "notebook_tuned_test_eta",
-        }
-    )
-    comparison = (
-        pd.DataFrame({"element": OMNIXAS_ELEMENTS})
-        .merge(universal_values, on="element", how="left")
-        .merge(tuned_values, on="element", how="left")
-    )
-    comparison["paper_universal_test_eta"] = comparison["element"].map(PAPER_UNIVERSAL_TEST_ETA)
-    comparison["paper_tuned_test_eta"] = comparison["element"].map(PAPER_TUNED_TEST_ETA)
-    comparison["stored_e2e_universal_test_eta"] = comparison["element"].map(
-        STORED_E2E_UNIVERSAL_TEST_ETA
-    )
-    comparison["stored_e2e_tuned_test_eta"] = comparison["element"].map(
-        STORED_E2E_TUNED_TEST_ETA
-    )
-    comparison.to_csv(run_dir / "omnixas_8_comparison.csv", index=False)
-    print("OmniXAS eight-element comparison:")
-    print(comparison.to_string(index=False))
-
-    eta_columns = [
-        "notebook_universal_val_eta",
-        "notebook_universal_test_eta",
-        "notebook_tuned_val_eta",
-        "notebook_tuned_test_eta",
-        "paper_universal_test_eta",
-        "paper_tuned_test_eta",
-        "stored_e2e_universal_test_eta",
-        "stored_e2e_tuned_test_eta",
-    ]
-    fig, ax = plt.subplots(figsize=(18, 7))
-    comparison.set_index("element")[eta_columns].plot(kind="bar", ax=ax)
-    ax.set_title("datasets differ; AnionXAS 200D first benchmark")
-    ax.set_xlabel("Element")
-    ax.set_ylabel("eta")
-    ax.legend(loc="upper left", bbox_to_anchor=(1.0, 1.0))
-    fig.tight_layout()
-    fig.savefig(run_dir / "omnixas_8_eta_comparison.png", dpi=200, bbox_inches="tight")
-    plt.close(fig)
-
-    if universal_checkpoint is not None:
-        assert len(universal_eval) == len(dataset_elements), (
-            "Expected one universal evaluation row per element: "
-            f"{len(universal_eval)} != {len(dataset_elements)}"
-        )
-    assert len(comparison) == 8, f"Expected 8 OmniXAS comparison rows, got {len(comparison)}"
-    print("Self-check passed.")
-    print(f"Output directory: {run_dir}")
+def write_csv(path: Path, columns: list[str], rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns, lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def main() -> int:
-    args = parse_args()
-    data_dir = resolve_path(
-        args.data_dir,
-        "ANIONXAS_UNIVERSAL_DATA_DIR",
-        REPO_ROOT / "output" / "anionxas_universal_prepared",
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data-dir", default=None)
+    parser.add_argument("--feature-npz", type=Path, default=DEFAULT_FEATURE_NPZ)
+    parser.add_argument("--spectral-npz", type=Path, default=DEFAULT_SPECTRAL_NPZ)
+    parser.add_argument("--training-root", default=None)
+    parser.add_argument("--run-name", default=DEFAULT_RUN_NAME)
+    parser.add_argument("--universal-elements", choices=tuple(SCOPE_NAMES), default="all")
+    parser.add_argument("--skip-universal", action="store_true")
+    parser.add_argument("--run-tuned", action="store_true")
+    parser.add_argument("--force-retrain", action="store_true")
+    parser.add_argument("--tuned-elements", nargs="+", default=DEFAULT_TUNED_ELEMENTS, metavar="ELEMENT")
+    parser.add_argument("--gpu", default=None)
+    parser.add_argument("--validate-only", action="store_true")
+    args = parser.parse_args()
+    data_value = args.data_dir if args.data_dir is not None else os.environ.get(
+        "ANIONXAS_UNIVERSAL_DATA_DIR", REPO_ROOT / "output" / "anionxas_universal_prepared"
     )
-    training_root = resolve_path(
-        args.training_root,
-        "ANIONXAS_TRAINING_ROOT",
-        REPO_ROOT / "output" / "training" / "anionxasUniversal",
+    training_value = args.training_root if args.training_root is not None else os.environ.get(
+        "ANIONXAS_TRAINING_ROOT", REPO_ROOT / "output" / "training" / "anionxas"
+    )
+    data_dir, training_root = (
+        Path(data_value).expanduser().resolve(),
+        Path(training_value).expanduser().resolve(),
     )
     if not args.run_name:
         raise ValueError("--run-name must not be empty")
     if not data_dir.exists():
-        print(
-            f"Prepared data directory does not exist. Preparing it from raw NPZ files: {data_dir}"
-        )
-        prepare_anionxas_data(
-            args.feature_npz.expanduser(), args.spectral_npz.expanduser(), data_dir
+        print(f"Preparing missing data in {data_dir}")
+        prepare_dataset(
+            args.feature_npz, args.spectral_npz, data_dir,
+            seed=SEED, train_frac=0.8, val_frac=0.1, test_frac=0.1, overwrite=False,
         )
     elif not data_dir.is_dir():
         raise ValueError(f"Prepared data path exists but is not a directory: {data_dir}")
-
-    (
-        X,
-        y,
-        elements,
-        material_ids,
-        sites,
-        split_codes,
-        metadata,
-        dataset_elements,
-        split_counts,
-    ) = load_and_validate_dataset(data_dir)
-    print_dataset_summary(
-        data_dir,
-        X,
-        y,
-        material_ids,
-        metadata,
-        split_codes,
-        dataset_elements,
-        split_counts,
+    data = load_dataset(data_dir)
+    print(f"Data: {data_dir}")
+    print(
+        f"Rows: {len(data.X)}  Materials: {len(np.unique(data.material_ids))}  "
+        f"Elements: {len(data.names)}  Dimensions: {data.X.shape[1]}->{data.y.shape[1]}"
     )
+    print("Element split counts:")
+    for element in data.names:
+        counts = [int(mask(data, element, split).sum()) for split in (0, 1, 2)]
+        print(f"  {element}: train={counts[0]} val={counts[1]} test={counts[2]}")
+    print(f"Split totals: {dict(sorted(Counter(data.split_codes.tolist()).items()))}")
+    print(f"Metadata keys: {sorted(data.metadata)}")
     if args.validate_only:
         return 0
 
+    universal = data.names.copy() if args.universal_elements == "all" else OMNIXAS_ELEMENTS.copy()
+    if args.universal_elements != "all":
+        missing = sorted(set(OMNIXAS_ELEMENTS) - set(data.names))
+        if missing:
+            raise ValueError(
+                "Universal scope 'omnixas8' requires every OmniXAS element: " f"{missing!r}"
+            )
+    universal_train, universal_val = baselines(data, universal)
+    scope_name = SCOPE_NAMES[args.universal_elements]
     run_dir = training_root / args.run_name
-    run_dir.mkdir(parents=True, exist_ok=True)
-    seed_everything(SEED, workers=True)
-    universal_best = universal_checkpoint_path(run_dir)
-    if args.skip_universal:
-        if universal_best.exists() and not universal_best.is_file():
-            raise ValueError(f"Universal checkpoint path is not a file: {universal_best}")
-        universal_checkpoint = universal_best if universal_best.is_file() else None
-    else:
-        train_mask = split_codes == 0
-        val_mask = split_codes == 1
-        train_elements = elements[train_mask]
-        element_counts = Counter(train_elements.tolist())
-        sample_weights = np.asarray(
-            [1.0 / element_counts[element] for element in train_elements], dtype=np.float64
+    if run_dir.exists() and not run_dir.is_dir():
+        raise ValueError(f"Training run path is not a directory: {run_dir}")
+    scope_root = run_dir / "heads" / "universalXAS" / scope_name
+    digest = hashlib.sha256()
+    for name in ("X", "y", "elements", "material_ids", "sites", "split_codes"):
+        value = np.asarray(getattr(data, name))
+        header = json.dumps(
+            {"name": name, "dtype": value.dtype.str, "shape": list(value.shape)},
+            sort_keys=True, separators=(",", ":"),
+        ).encode()
+        digest.update(len(header).to_bytes(8, "big"))
+        digest.update(header)
+        digest.update((value if value.flags.c_contiguous else np.ascontiguousarray(value)).view(np.uint8))
+    expected = {
+        "seed": SEED, "objective": HEAD_OBJECTIVE, "input_dim": INPUT_DIM,
+        "output_dim": OUTPUT_DIM, "hidden_dims": HIDDEN_DIMS,
+        "universal_scope": args.universal_elements, "universal_scope_name": scope_name,
+        "universal_elements": universal, "data_dir": str(data_dir.resolve()),
+        "dataset_fingerprint": digest.hexdigest(),
+        "metadata": {key: value for key, value in data.metadata.items() if key != "created_at"},
+        "baselines": {"training": universal_train.tolist(), "validation": universal_val.tolist()},
+        "universal_hyperparameters": UNIVERSAL_HPARAMS, "tuned_hyperparameters": TUNED_SETTINGS,
+        "checkpoint_layout": "heads/<family>/<scope>/runs/<setting>/best.ckpt",
+    }
+    if scope_root.exists() and not scope_root.is_dir():
+        raise ValueError(f"Training scope path is not a directory: {scope_root}")
+    config = scope_root / "training_config.json"
+    if config.exists() and not config.is_file():
+        raise ValueError(f"Training config path is not a file: {config}")
+    if config.is_file():
+        try:
+            actual = json.loads(config.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Could not read training config: {config}") from exc
+        if actual != expected and (args.skip_universal or not args.force_retrain):
+            raise ValueError(
+                f"Existing training config does not match requested provenance: {config}"
+            )
+    elif args.skip_universal:
+        raise FileNotFoundError(f"Required training config does not exist: {config}")
+    elif scope_root.exists() and any(scope_root.rglob("*.ckpt")) and not args.force_retrain:
+        raise ValueError(f"Training provenance is missing: {config}. Use --force-retrain")
+    scope_root.mkdir(parents=True, exist_ok=True)
+    if not config.exists() or args.force_retrain:
+        config.write_text(
+            json.dumps(expected, indent=2, sort_keys=True, allow_nan=False) + "\n", encoding="utf-8"
         )
-        universal_sampler = WeightedRandomSampler(
-            weights=torch.as_tensor(sample_weights, dtype=torch.double),
-            num_samples=len(sample_weights),
-            replacement=True,
-            generator=torch.Generator().manual_seed(SEED),
-        )
-        universal_train_loader = make_loader(
-            X,
-            y,
-            train_mask,
-            UNIVERSAL_HPARAMS["batch_size"],
-            sampler=universal_sampler,
-            training=True,
-        )
-        universal_val_loader = make_loader(X, y, val_mask, UNIVERSAL_HPARAMS["batch_size"])
-        universal_module = make_module(UNIVERSAL_HPARAMS)
-        universal_checkpoint = fit_head(
-            universal_module,
-            universal_train_loader,
-            universal_val_loader,
-            universal_best.parent,
-            UNIVERSAL_HPARAMS,
-            force_retrain=args.force_retrain,
-        )
-    if universal_checkpoint is None:
-        print(
-            "No universal checkpoint found; set --skip-universal off or "
-            "provide the expected checkpoint."
-        )
-    else:
-        print(f"Universal checkpoint: {universal_checkpoint}")
 
-    tuned_elements = resolve_tuned_elements(args.tuned_elements, dataset_elements)
-    tuned_checkpoints = collect_tuned_checkpoints(
-        run_dir=run_dir,
-        X=X,
-        y=y,
-        elements=elements,
-        split_codes=split_codes,
-        dataset_elements=dataset_elements,
-        tuned_elements=tuned_elements,
-        run_tuned=args.run_tuned,
-        force_retrain=args.force_retrain,
-        universal_checkpoint=universal_checkpoint,
-    )
-    evaluate_and_save(
-        run_dir=run_dir,
-        X=X,
-        y=y,
-        elements=elements,
-        split_codes=split_codes,
-        dataset_elements=dataset_elements,
-        universal_checkpoint=universal_checkpoint,
-        tuned_checkpoints=tuned_checkpoints,
-    )
+    seed_everything(SEED, workers=True)
+    universal_run = head_run_dir(run_dir, "universalXAS", scope_name, setting_name(UNIVERSAL_HPARAMS))
+    universal_best = universal_run / "best.ckpt"
+    if args.skip_universal:
+        if not universal_best.is_file():
+            raise FileNotFoundError(
+                f"--skip-universal requires the requested checkpoint: {universal_best}"
+            )
+        universal_checkpoint = universal_best
+    else:
+        universal_checkpoint = train_head(
+            data, universal, UNIVERSAL_HPARAMS, universal_train, universal_val,
+            universal_run, force=args.force_retrain,
+        )
+    print(f"Universal checkpoint: {universal_checkpoint}")
+    tuned_checkpoints: dict[tuple[str, str], Path] = {}
+    tuned_root = run_dir / "heads" / "tunedUniversalXAS" / scope_name
+    tuned: list[str] = []
+    if args.run_tuned or tuned_root.exists():
+        if any(element.lower() == "all" for element in args.tuned_elements):
+            if len(args.tuned_elements) != 1:
+                raise ValueError("--tuned-elements='all' cannot be mixed with named elements")
+            tuned = data.names.copy()
+        else:
+            unknown = sorted(set(args.tuned_elements) - set(data.names))
+            if unknown:
+                raise ValueError(f"Unknown configured element name(s): {unknown}")
+            tuned = args.tuned_elements.copy()
+        outside = sorted(set(tuned) - set(universal))
+        if outside:
+            raise ValueError(f"Tuned elements are outside the universal scope: {outside!r}")
+        if len(set(tuned)) != len(tuned):
+            raise ValueError(f"Tuned elements must be unique: {tuned!r}")
+    if args.run_tuned:
+        for element in tuned:
+            train_base, val_base = baselines(data, [element])
+            for setting in TUNED_SETTINGS:
+                hparams = {**setting, "monitor": "val_balanced_rel_mse"}
+                name = setting_name(hparams)
+                tuned_checkpoints[(element, name)] = train_head(
+                    data, [element], hparams, train_base, val_base,
+                    head_run_dir(run_dir, "tunedUniversalXAS", scope_name, name, element),
+                    force=args.force_retrain, source=universal_checkpoint,
+                )
+    else:
+        if tuned_root.exists() and not tuned_root.is_dir():
+            raise ValueError(f"Tuned scope path is not a directory: {tuned_root}")
+        for element in tuned:
+            runs = tuned_root / element / "runs"
+            if not runs.exists():
+                continue
+            if not runs.is_dir():
+                raise ValueError(f"Tuned runs path is not a directory: {runs}")
+            for setting_dir in sorted(path for path in runs.iterdir() if path.is_dir()):
+                checkpoint = setting_dir / "best.ckpt"
+                if HEAD_OBJECTIVE not in setting_dir.name or not checkpoint.exists():
+                    continue
+                if not checkpoint.is_file():
+                    raise ValueError(f"Checkpoint path is not a file: {checkpoint}")
+                check_manifest(setting_dir, universal_checkpoint)
+                tuned_checkpoints[(element, setting_dir.name)] = checkpoint
+
+    universal_key = universal_checkpoint.resolve()
+    prediction_paths = {universal_key: universal_checkpoint}
+    prediction_rows = {
+        universal_key: np.flatnonzero(np.isin(data.elements, universal) & (data.split_codes != 0))
+    }
+    for (element, _), checkpoint in tuned_checkpoints.items():
+        key = checkpoint.resolve()
+        rows = np.flatnonzero(mask(data, element, 1) | mask(data, element, 2))
+        prediction_paths.setdefault(key, checkpoint)
+        if key in prediction_rows:
+            prediction_rows[key] = np.union1d(prediction_rows[key], rows)
+        else:
+            prediction_rows[key] = rows
+    cache = {
+        key: (prediction_rows[key], predict(path, data.X[prediction_rows[key]]))
+        for key, path in prediction_paths.items()
+    }
+
+    candidates = []
+    for (element, setting), checkpoint in tuned_checkpoints.items():
+        rows, predictions = cache[checkpoint.resolve()]
+        validation = mask(data, element, 1)[rows]
+        val_eta, val_mse = eta(data, element, 1, predictions[validation])
+        candidates.append({
+            "element": element, "setting": setting, "checkpoint": str(checkpoint),
+            "val_eta": val_eta, "val_median_mse": val_mse,
+            "n_train": int(mask(data, element, 0).sum()), "n_val": int(validation.sum()),
+        })
+    candidates.sort(key=lambda row: (row["element"], -row["val_eta"], row["setting"]))
+    selected = {}
+    for row in candidates:
+        selected.setdefault(row["element"], row)
+    universal_rows, universal_predictions = cache[universal_key]
+    universal_results = []
+    for element in universal:
+        validation, test = mask(data, element, 1)[universal_rows], mask(data, element, 2)[universal_rows]
+        val_eta, val_mse = eta(data, element, 1, universal_predictions[validation])
+        test_eta, test_mse = eta(data, element, 2, universal_predictions[test])
+        universal_results.append({
+            "element": element, "n_train": int(mask(data, element, 0).sum()),
+            "n_val": int(validation.sum()), "n_test": int(test.sum()),
+            "val_eta": val_eta, "test_eta": test_eta,
+            "val_median_mse": val_mse, "test_median_mse": test_mse,
+        })
+    tuned_results = []
+    for row in selected.values():
+        element = row["element"]
+        rows, predictions = cache[Path(row["checkpoint"]).resolve()]
+        test = mask(data, element, 2)[rows]
+        test_eta, test_mse = eta(data, element, 2, predictions[test])
+        tuned_results.append({
+            **row, "n_test": int(test.sum()), "test_eta": test_eta,
+            "test_median_mse": test_mse,
+        })
+
+    evaluation_dir = run_dir / "evaluations" / scope_name
+    if evaluation_dir.exists() and not evaluation_dir.is_dir():
+        raise ValueError(f"Evaluation output path is not a directory: {evaluation_dir}")
+    evaluation_dir.mkdir(parents=True, exist_ok=True)
+    write_csv(evaluation_dir / "tuned_validation_candidates.csv", CANDIDATE_COLUMNS, candidates)
+    if selected:
+        print("Selected tuned heads:")
+        for row in selected.values():
+            print(f"  {row['element']}: {row['setting']} (validation eta={row['val_eta']:.6g})")
+    write_csv(evaluation_dir / "universal_eval_by_element.csv", UNIVERSAL_COLUMNS, universal_results)
+    write_csv(evaluation_dir / "tuned_eval_by_element.csv", TUNED_COLUMNS, tuned_results)
+    print(f"Output directory: {evaluation_dir}")
     return 0
 
 
