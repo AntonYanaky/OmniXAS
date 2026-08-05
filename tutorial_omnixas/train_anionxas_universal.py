@@ -641,6 +641,8 @@ class BalancedRelativeMSEModule(PlModule):
         return mse.mean()
 
     def on_validation_epoch_end(self) -> None:
+        if self.trainer.sanity_checking:
+            return
         if not self._val_mse:
             raise ValueError("Validation produced no batches")
         mse, indices = torch.cat(self._val_mse), torch.cat(self._val_elements)

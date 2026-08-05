@@ -3,6 +3,7 @@ import json
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -40,6 +41,22 @@ def test_balanced_module_state_loads_into_plain_module() -> None:
 
     plain = training.PlModule(training.XASBlock(4, [3], 2))
     plain.load_state_dict(state, strict=True)
+
+
+def test_balanced_module_skips_partial_sanity_validation() -> None:
+    module = training.BalancedRelativeMSEModule(
+        training.XASBlock(1, [2], 1), np.array([1.0, 2.0]), np.array([3.0, 4.0])
+    )
+    module._val_mse = [torch.tensor([1.0])]
+    module._val_elements = [torch.tensor([0])]
+    module._trainer = SimpleNamespace(sanity_checking=True)
+    module.log = lambda *args, **kwargs: None
+
+    module.on_validation_epoch_end()
+
+    module._trainer = SimpleNamespace(sanity_checking=False)
+    with pytest.raises(ValueError, match="Validation has no rows for element index 1"):
+        module.on_validation_epoch_end()
 
 
 def test_baselines_use_each_element_training_mean() -> None:
