@@ -4,16 +4,22 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import csv
 from collections import Counter
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import hashlib
 import json
+import math
+import operator
 import os
 from pathlib import Path
 import shutil
 import sys
+import tempfile
 from typing import Any
+import uuid
 
 # Set the device before importing torch or Lightning.
 _gpu_parser = argparse.ArgumentParser(add_help=False)
@@ -33,7 +39,6 @@ from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 
 from omnixas.model.training import PlModule
 from omnixas.model.xasblock import XASBlock
-from scripts.prepare_anionxas_universal import prepare_dataset
 
 INPUT_DIM = 64
 OUTPUT_DIM = 200
@@ -69,6 +74,390 @@ TUNED_COLUMNS = [
     "element", "setting", "checkpoint", "n_train", "n_val", "n_test",
     "val_eta", "test_eta", "val_median_mse", "test_median_mse"
 ]
+SPLIT_NAMES = ("train", "val", "test")
+SPLIT_CODES = {name: code for code, name in enumerate(SPLIT_NAMES)}
+
+
+class PreparationError(ValueError):
+    """Raised when source data or preparation invariants are invalid."""
+
+
+def prepare_dataset(
+    feature_npz: str | os.PathLike[str],
+    spectral_npz: str | os.PathLike[str],
+    out_dir: str | os.PathLike[str],
+    seed: int = SEED,
+    train_frac: float = 0.8,
+    val_frac: float = 0.1,
+    test_frac: float = 0.1,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """Prepare aligned AnionXAS arrays with deterministic material splits."""
+    feature_path = Path(feature_npz).expanduser()
+    spectral_path = Path(spectral_npz).expanduser()
+    output_dir = Path(out_dir).expanduser()
+    for path, label in ((feature_path, "feature NPZ"), (spectral_path, "spectral NPZ")):
+        if not path.exists():
+            raise PreparationError(f"{label} does not exist: {path}")
+        if not path.is_file():
+            raise PreparationError(f"{label} is not a file: {path}")
+    if output_dir.is_symlink():
+        raise PreparationError(f"output path must not be a symlink: {output_dir}")
+    if output_dir.exists():
+        if not output_dir.is_dir():
+            raise PreparationError(f"output path is not a directory: {output_dir}")
+        if not overwrite:
+            raise PreparationError(
+                f"output directory already exists: {output_dir}; use --overwrite to replace it"
+            )
+    if output_dir.parent.exists() and not output_dir.parent.is_dir():
+        raise PreparationError(f"output parent is not a directory: {output_dir.parent}")
+
+    if isinstance(seed, bool):
+        raise PreparationError("seed must be a non-negative integer")
+    try:
+        seed_int = operator.index(seed)
+    except TypeError as exc:
+        raise PreparationError("seed must be a non-negative integer") from exc
+    if seed_int < 0:
+        raise PreparationError("seed must be a non-negative integer")
+    seed_int = int(seed_int)
+
+    requested_fractions = (train_frac, val_frac, test_frac)
+    checked_fractions = []
+    for name, value in zip(SPLIT_NAMES, requested_fractions):
+        if isinstance(value, bool):
+            raise PreparationError(f"{name}_frac must be a finite non-negative number")
+        try:
+            fraction = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise PreparationError(
+                f"{name}_frac must be a finite non-negative number"
+            ) from exc
+        if not math.isfinite(fraction) or fraction < 0:
+            raise PreparationError(f"{name}_frac must be a finite non-negative number")
+        checked_fractions.append(fraction)
+    fraction_total = sum(checked_fractions)
+    if not math.isclose(fraction_total, 1.0, rel_tol=1e-7, abs_tol=1e-6):
+        raise PreparationError(
+            "train_frac + val_frac + test_frac must sum approximately to 1 "
+            f"(got {fraction_total!r})"
+        )
+    if fraction_total == 0:
+        raise PreparationError("split fractions must have a positive sum")
+    normalized_fractions = tuple(fraction / fraction_total for fraction in checked_fractions)
+
+    try:
+        feature_archive = np.load(feature_path, allow_pickle=False)
+    except Exception as exc:
+        raise PreparationError(f"could not load feature NPZ {feature_path}: {exc}") from exc
+    try:
+        spectral_archive = np.load(spectral_path, allow_pickle=False)
+    except Exception as exc:
+        if isinstance(feature_archive, np.lib.npyio.NpzFile):
+            feature_archive.close()
+        raise PreparationError(f"could not load spectral NPZ {spectral_path}: {exc}") from exc
+
+    try:
+        if not isinstance(feature_archive, np.lib.npyio.NpzFile):
+            raise PreparationError(f"feature input is not an NPZ archive: {feature_path}")
+        if not isinstance(spectral_archive, np.lib.npyio.NpzFile):
+            raise PreparationError(f"spectral input is not an NPZ archive: {spectral_path}")
+        feature_keys = set(feature_archive.files)
+        spectral_keys = set(spectral_archive.files)
+        if feature_keys != spectral_keys:
+            missing_from_spectral = sorted(feature_keys - spectral_keys)
+            missing_from_feature = sorted(spectral_keys - feature_keys)
+            raise PreparationError(
+                "feature and spectral NPZ key sets differ; "
+                f"missing from spectral={missing_from_spectral!r}, "
+                f"missing from feature={missing_from_feature!r}"
+            )
+        if not feature_keys:
+            raise PreparationError("feature and spectral NPZ archives contain no arrays")
+
+        records = []
+        for key in feature_keys:
+            if "\n" in key or "\r" in key:
+                raise PreparationError(
+                    f"key contains a line break and cannot be written safely: {key!r}"
+                )
+            try:
+                parsed = ast.literal_eval(key)
+            except (SyntaxError, ValueError, TypeError) as exc:
+                raise PreparationError(
+                    f"key {key!r} is not a valid Python tuple/list literal"
+                ) from exc
+            if not isinstance(parsed, (tuple, list)) or len(parsed) != 3:
+                raise PreparationError(
+                    f"key {key!r} must parse to a 3-tuple or 3-item list"
+                )
+            element, material_id, raw_site = parsed
+            if not isinstance(element, str):
+                raise PreparationError(f"key {key!r} element must be a string")
+            if not isinstance(material_id, str):
+                raise PreparationError(f"key {key!r} material_id must be a string")
+            if isinstance(raw_site, bool):
+                raise PreparationError(
+                    f"key {key!r} has a boolean site; expected an integer"
+                )
+            try:
+                site = int(raw_site)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise PreparationError(
+                    f"key {key!r} has a site that is not int-compatible: {raw_site!r}"
+                ) from exc
+            if isinstance(raw_site, float) and (
+                not math.isfinite(raw_site) or not raw_site.is_integer()
+            ):
+                raise PreparationError(
+                    f"key {key!r} has a non-integral site: {raw_site!r}"
+                )
+            if site < np.iinfo(np.int64).min or site > np.iinfo(np.int64).max:
+                raise PreparationError(f"key {key!r} site is outside the int64 range")
+            records.append((element, material_id, site, key))
+        records.sort(key=lambda record: (record[0], record[1], record[2], record[3]))
+
+        feature_rows = []
+        target_rows = []
+        elements = []
+        material_ids = []
+        sites = []
+        keys = []
+        for element, material_id, site, key in records:
+            arrays = []
+            for label, archive, expected_dim in (
+                ("feature", feature_archive, INPUT_DIM),
+                ("spectral", spectral_archive, OUTPUT_DIM),
+            ):
+                try:
+                    array = np.asarray(archive[key])
+                except (KeyError, ValueError, TypeError) as exc:
+                    raise PreparationError(
+                        f"could not read {label} array for key {key!r}: {exc}"
+                    ) from exc
+                if array.ndim != 1 or array.shape[0] != expected_dim:
+                    raise PreparationError(
+                        f"{label} array for key {key!r} must be a one-dimensional array "
+                        f"of length {expected_dim}; got shape {array.shape}"
+                    )
+                if array.dtype.kind not in "iuf":
+                    raise PreparationError(
+                        f"{label} array for key {key!r} must have a real numeric dtype; "
+                        f"got {array.dtype}"
+                    )
+                try:
+                    with np.errstate(over="ignore", invalid="ignore"):
+                        converted = np.asarray(array, dtype=np.float32)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise PreparationError(
+                        f"{label} array for key {key!r} could not be converted to float32"
+                    ) from exc
+                if not np.isfinite(converted).all():
+                    raise PreparationError(
+                        f"{label} array for key {key!r} contains non-finite values "
+                        "or overflows float32"
+                    )
+                arrays.append(converted)
+            feature_rows.append(arrays[0])
+            target_rows.append(arrays[1])
+            elements.append(element)
+            material_ids.append(material_id)
+            sites.append(site)
+            keys.append(key)
+    finally:
+        if isinstance(feature_archive, np.lib.npyio.NpzFile):
+            feature_archive.close()
+        if isinstance(spectral_archive, np.lib.npyio.NpzFile):
+            spectral_archive.close()
+
+    if not feature_rows:
+        raise PreparationError("no valid rows were found")
+    X = np.stack(feature_rows, axis=0).astype(np.float32, copy=False)
+    y = np.stack(target_rows, axis=0).astype(np.float32, copy=False)
+    material_counts = Counter(material_ids)
+    materials = sorted(material_counts)
+    shuffled_materials = [
+        materials[int(index)] for index in np.random.default_rng(seed_int).permutation(len(materials))
+    ]
+    ordered_materials = sorted(
+        shuffled_materials, key=lambda material: -material_counts[material]
+    )
+    total_rows = len(material_ids)
+    targets = np.asarray(normalized_fractions, dtype=np.float64) * total_rows
+    current = np.zeros(len(SPLIT_NAMES), dtype=np.int64)
+    material_splits = {}
+    for position, material in enumerate(ordered_materials):
+        remaining_materials = len(ordered_materials) - position - 1
+        empty_active = [
+            split
+            for split, target in enumerate(targets)
+            if target > 0 and current[split] == 0
+        ]
+        if empty_active and remaining_materials <= len(empty_active):
+            candidates = empty_active
+        else:
+            candidates = list(range(len(SPLIT_NAMES)))
+        deficits = targets - current
+        if any(deficits[split] > 0 for split in range(len(SPLIT_NAMES))):
+            split = max(candidates, key=lambda candidate: deficits[candidate])
+        else:
+            ratios = []
+            for candidate in candidates:
+                target = targets[candidate]
+                ratios.append(
+                    math.inf if target <= 0 else current[candidate] / target
+                )
+            split = candidates[int(np.argmin(ratios))]
+        material_splits[material] = split
+        current[split] += material_counts[material]
+    if len(material_splits) != len(material_counts):
+        raise PreparationError("internal error: not every material received a split")
+
+    split_codes = np.asarray(
+        [material_splits[material_id] for material_id in material_ids], dtype=np.int8
+    )
+    material_to_splits = {}
+    for material_id, split_code in zip(material_ids, split_codes):
+        material_to_splits.setdefault(material_id, set()).add(int(split_code))
+    overlapping_materials = sorted(
+        material_id
+        for material_id, splits in material_to_splits.items()
+        if len(splits) != 1
+    )
+    if overlapping_materials:
+        raise PreparationError(
+            f"internal error: materials occur in multiple splits: {overlapping_materials!r}"
+        )
+    active_split_count = sum(fraction > 0 for fraction in normalized_fractions)
+    if len(material_counts) >= active_split_count:
+        empty_active_splits = [
+            SPLIT_NAMES[index]
+            for index, fraction in enumerate(normalized_fractions)
+            if fraction > 0 and not np.any(split_codes == index)
+        ]
+        if empty_active_splits:
+            raise PreparationError(
+                "internal error: an active split is empty despite enough materials: "
+                f"{empty_active_splits!r}"
+            )
+
+    split_counts_array = np.bincount(split_codes.astype(np.int64), minlength=3)
+    split_counts = {
+        split_name: int(split_counts_array[index])
+        for index, split_name in enumerate(SPLIT_NAMES)
+    }
+    created_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace(
+        "+00:00", "Z"
+    )
+    element_list = sorted(set(elements))
+    metadata = {
+        "input_paths": {
+            "feature_npz": str(feature_path.resolve()),
+            "spectral_npz": str(spectral_path.resolve()),
+        },
+        "row_count": int(X.shape[0]),
+        "feature_dim": int(X.shape[1]),
+        "target_dim": int(y.shape[1]),
+        "split_fractions": {
+            split_name: float(checked_fractions[index])
+            for index, split_name in enumerate(SPLIT_NAMES)
+        },
+        "split_counts": split_counts,
+        "seed": seed_int,
+        "created_at": created_at,
+        "elements": element_list,
+        "split_code_mapping": dict(SPLIT_CODES),
+    }
+
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    temporary_dir = Path(
+        tempfile.mkdtemp(prefix=f".{output_dir.name}.tmp-", dir=str(output_dir.parent))
+    )
+    try:
+        np.save(temporary_dir / "X.npy", X)
+        np.save(temporary_dir / "y.npy", y)
+        np.save(temporary_dir / "elements.npy", np.asarray(elements))
+        np.save(temporary_dir / "material_ids.npy", np.asarray(material_ids))
+        np.save(temporary_dir / "sites.npy", np.asarray(sites, dtype=np.int64))
+        np.save(temporary_dir / "split_codes.npy", split_codes.astype(np.int8, copy=False))
+        (temporary_dir / "keys.txt").write_text(
+            "".join(f"{key}\n" for key in keys), encoding="utf-8"
+        )
+        with (temporary_dir / "manifest.csv").open(
+            "w", encoding="utf-8", newline=""
+        ) as handle:
+            writer = csv.writer(handle, lineterminator="\n")
+            writer.writerow(("row_index", "key", "element", "material_id", "site", "split"))
+            for index, (key, element, material_id, site) in enumerate(
+                zip(keys, elements, material_ids, sites)
+            ):
+                writer.writerow(
+                    (index, key, element, material_id, site, SPLIT_NAMES[int(split_codes[index])])
+                )
+        element_counts = Counter(elements)
+        with (temporary_dir / "element_counts.csv").open(
+            "w", encoding="utf-8", newline=""
+        ) as handle:
+            writer = csv.writer(handle, lineterminator="\n")
+            writer.writerow(("element", "count"))
+            for element in sorted(element_counts):
+                writer.writerow((element, element_counts[element]))
+        split_element_counts = {
+            split_name: {element: 0 for element in element_list}
+            for split_name in SPLIT_NAMES
+        }
+        for element, split_code in zip(elements, split_codes):
+            split_element_counts[SPLIT_NAMES[int(split_code)]][element] += 1
+        with (temporary_dir / "split_counts_by_element.csv").open(
+            "w", encoding="utf-8", newline=""
+        ) as handle:
+            writer = csv.writer(handle, lineterminator="\n")
+            writer.writerow(("split", "element", "count"))
+            for split_name in SPLIT_NAMES:
+                for element in element_list:
+                    writer.writerow((split_name, element, split_element_counts[split_name][element]))
+        with (temporary_dir / "metadata.json").open("w", encoding="utf-8") as handle:
+            json.dump(metadata, handle, indent=2, sort_keys=True, allow_nan=False)
+            handle.write("\n")
+
+        expected_files = {
+            "X.npy", "y.npy", "elements.npy", "material_ids.npy", "sites.npy",
+            "split_codes.npy", "metadata.json", "keys.txt", "manifest.csv",
+            "element_counts.csv", "split_counts_by_element.csv",
+        }
+        actual_files = {path.name for path in temporary_dir.iterdir() if path.is_file()}
+        if actual_files != expected_files:
+            raise PreparationError(
+                f"internal error: prepared output files are {sorted(actual_files)!r}"
+            )
+
+        backup_dir = None
+        try:
+            if output_dir.exists():
+                backup_dir = output_dir.parent / (
+                    f".{output_dir.name}.backup-{uuid.uuid4().hex}"
+                )
+                os.replace(output_dir, backup_dir)
+            os.replace(temporary_dir, output_dir)
+        except Exception:
+            if backup_dir is not None and backup_dir.exists() and not output_dir.exists():
+                try:
+                    os.replace(backup_dir, output_dir)
+                except OSError as restore_error:
+                    raise OSError(
+                        f"could not commit output and could not restore {output_dir}: "
+                        f"{restore_error}"
+                    ) from restore_error
+            raise
+        else:
+            if backup_dir is not None:
+                shutil.rmtree(backup_dir)
+    except Exception:
+        if temporary_dir.exists():
+            shutil.rmtree(temporary_dir)
+        raise
+    return metadata
 
 
 @dataclass(frozen=True)

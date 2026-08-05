@@ -1,3 +1,4 @@
+import ast
 import json
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
@@ -119,3 +120,48 @@ def test_tuned_manifest_rejects_changed_universal(tmp_path: Path) -> None:
     universal.write_bytes(b"changed")
     with pytest.raises(ValueError, match="does not match"):
         training.check_manifest(setting, universal)
+
+
+def test_local_prepare_dataset_loads_aligned_material_split(tmp_path: Path) -> None:
+    keys = []
+    for material in reversed([f"mat-{index:02d}" for index in range(1, 10)]):
+        keys.extend((f"['Cu', '{material}', 1]", f"('Cu', '{material}', 0)"))
+    markers = {key: index for index, key in enumerate(keys)}
+    feature_path = tmp_path / "features.npz"
+    spectral_path = tmp_path / "spectra.npz"
+    np.savez(
+        feature_path,
+        **{key: np.full(training.INPUT_DIM, marker, dtype=np.float64)
+           for key, marker in markers.items()},
+    )
+    np.savez(
+        spectral_path,
+        **{key: np.full(training.OUTPUT_DIM, marker + 1000, dtype=np.float64)
+           for key, marker in markers.items()},
+    )
+
+    output_dir = tmp_path / "prepared"
+    training.prepare_dataset(feature_path, spectral_path, output_dir)
+    data = training.load_dataset(output_dir)
+    expected_keys = sorted(
+        keys,
+        key=lambda key: (*ast.literal_eval(key)[:2], ast.literal_eval(key)[2], key),
+    )
+    expected_markers = [markers[key] for key in expected_keys]
+
+    assert {
+        path.name for path in output_dir.iterdir()
+    } == {
+        "X.npy", "y.npy", "elements.npy", "material_ids.npy", "sites.npy",
+        "split_codes.npy", "metadata.json", "keys.txt", "manifest.csv",
+        "element_counts.csv", "split_counts_by_element.csv",
+    }
+    assert (output_dir / "keys.txt").read_text(encoding="utf-8").splitlines() == expected_keys
+    assert data.X[:, 0].tolist() == expected_markers
+    assert data.y[:, 0].tolist() == [marker + 1000 for marker in expected_markers]
+    assert data.elements.tolist() == ["Cu"] * len(expected_keys)
+    assert data.material_ids.tolist() == [ast.literal_eval(key)[1] for key in expected_keys]
+    assert data.sites.tolist() == [ast.literal_eval(key)[2] for key in expected_keys]
+    for material in set(data.material_ids):
+        assert len(set(data.split_codes[data.material_ids == material].tolist())) == 1
+    assert set(data.split_codes.tolist()) == {0, 1, 2}
