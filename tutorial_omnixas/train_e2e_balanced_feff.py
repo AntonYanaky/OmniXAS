@@ -2,8 +2,8 @@
 """Train a balanced FEFF-only end-to-end encoder and XAS heads.
 
 The pipeline trains a scratch encoder with an element-balanced graph loader,
-exports frozen FEFF features, trains one UniversalXAS head, and fine-tunes one
-Tuned-UniversalXAS head for each FEFF element.
+exports frozen FEFF features, sweeps UniversalXAS heads, and sweeps
+Tuned-UniversalXAS heads for each FEFF element.
 """
 
 from __future__ import annotations
@@ -63,26 +63,140 @@ from train_e2e_custom_universal import (
 
 
 E2E_MIN_LR = 1e-6
-HEAD_BATCH_SIZE = 48
-UNIVERSAL_SEED = 44
-UNIVERSAL_LR = 5e-4
-UNIVERSAL_DROPOUT = 0.10
-UNIVERSAL_EPOCHS = 1000
-UNIVERSAL_PATIENCE = 60
-UNIVERSAL_PLATEAU_FACTOR = 0.5
-UNIVERSAL_PLATEAU_PATIENCE = 8
-UNIVERSAL_VARIANT = "feff_plateau_lr5e-4_do010_seed44"
-TUNED_SETTING = {
-    "name": "cosT500_lr3e-4_do0p15_p60",
-    "seed": 145,
-    "dropout": 0.15,
-    "lr": 3e-4,
-    "cosine_t": 500,
-    "eta_min": 1e-6,
-    "batch_size": HEAD_BATCH_SIZE,
-    "epochs": 1000,
-    "patience": 60,
-}
+HEAD_BATCH_SIZE = 96
+
+UNIVERSAL_SWEEP = [
+    {
+        "name": "feff_plateau_lr5e-4_do010_seed44",
+        "seed": 44,
+        "dropout": 0.10,
+        "lr": 5e-4,
+        "scheduler": "plateau",
+        "plateau_factor": 0.5,
+        "plateau_patience": 8,
+        "plateau_min_lr": 1e-6,
+        "epochs": 1000,
+        "early_stopping_patience": 60,
+        "batch_size": HEAD_BATCH_SIZE,
+    },
+    {
+        "name": "feff_plateau_lr4e-4_do010_seed45",
+        "seed": 45,
+        "dropout": 0.10,
+        "lr": 4e-4,
+        "scheduler": "plateau",
+        "plateau_factor": 0.5,
+        "plateau_patience": 8,
+        "plateau_min_lr": 1e-6,
+        "epochs": 1000,
+        "early_stopping_patience": 60,
+        "batch_size": HEAD_BATCH_SIZE,
+    },
+    {
+        "name": "feff_plateau_lr5e-4_do015_seed46",
+        "seed": 46,
+        "dropout": 0.15,
+        "lr": 5e-4,
+        "scheduler": "plateau",
+        "plateau_factor": 0.5,
+        "plateau_patience": 8,
+        "plateau_min_lr": 1e-6,
+        "epochs": 1000,
+        "early_stopping_patience": 60,
+        "batch_size": HEAD_BATCH_SIZE,
+    },
+]
+
+TUNED_SWEEP = [
+    {
+        "name": "cosT500_lr3e-4_do0p15_p60",
+        "seed": 145,
+        "dropout": 0.15,
+        "lr": 3e-4,
+        "cosine_t": 500,
+        "eta_min": E2E_MIN_LR,
+        "batch_size": HEAD_BATCH_SIZE,
+        "epochs": 1000,
+        "patience": 60,
+    },
+    {
+        "name": "cosT500_lr2e-4_do0p15_p60",
+        "seed": 145,
+        "dropout": 0.15,
+        "lr": 2e-4,
+        "cosine_t": 500,
+        "eta_min": E2E_MIN_LR,
+        "batch_size": HEAD_BATCH_SIZE,
+        "epochs": 1000,
+        "patience": 60,
+    },
+    {
+        "name": "cosT500_lr4e-4_do0p15_p60",
+        "seed": 145,
+        "dropout": 0.15,
+        "lr": 4e-4,
+        "cosine_t": 500,
+        "eta_min": E2E_MIN_LR,
+        "batch_size": HEAD_BATCH_SIZE,
+        "epochs": 1000,
+        "patience": 60,
+    },
+    {
+        "name": "cosT500_lr3e-4_do0p10_p60",
+        "seed": 145,
+        "dropout": 0.10,
+        "lr": 3e-4,
+        "cosine_t": 500,
+        "eta_min": E2E_MIN_LR,
+        "batch_size": HEAD_BATCH_SIZE,
+        "epochs": 1000,
+        "patience": 60,
+    },
+    {
+        "name": "cosT500_lr3e-4_do0p20_p60",
+        "seed": 145,
+        "dropout": 0.20,
+        "lr": 3e-4,
+        "cosine_t": 500,
+        "eta_min": E2E_MIN_LR,
+        "batch_size": HEAD_BATCH_SIZE,
+        "epochs": 1000,
+        "patience": 60,
+    },
+    {
+        "name": "cosT750_lr3e-4_do0p15_p60",
+        "seed": 145,
+        "dropout": 0.15,
+        "lr": 3e-4,
+        "cosine_t": 750,
+        "eta_min": E2E_MIN_LR,
+        "batch_size": HEAD_BATCH_SIZE,
+        "epochs": 1000,
+        "patience": 60,
+    },
+    {
+        "name": "cosT350_lr3e-4_do0p15_p60",
+        "seed": 145,
+        "dropout": 0.15,
+        "lr": 3e-4,
+        "cosine_t": 350,
+        "eta_min": E2E_MIN_LR,
+        "batch_size": HEAD_BATCH_SIZE,
+        "epochs": 1000,
+        "patience": 60,
+    },
+    {
+        "name": "cosT750_lr4e-4_do0p15_p60",
+        "seed": 145,
+        "dropout": 0.15,
+        "lr": 4e-4,
+        "cosine_t": 750,
+        "eta_min": E2E_MIN_LR,
+        "batch_size": HEAD_BATCH_SIZE,
+        "epochs": 1000,
+        "patience": 60,
+    },
+]
 
 
 class BalancedTaskBatchSampler(Sampler[list[int]]):
@@ -282,7 +396,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--e2e-plateau-patience", type=int, default=8)
     parser.add_argument("--e2e-epochs", type=int, default=1000)
     parser.add_argument("--e2e-patience", type=int, default=60)
-    parser.add_argument("--rows-per-element", type=int, default=6)
+    parser.add_argument("--rows-per-element", type=int, default=12)
     return parser.parse_args()
 
 
@@ -515,29 +629,80 @@ def evaluate_e2e(
     csv_write(run / "e2e_eval.csv", rows)
 
 
-def train_universal(features: Path, e2e_checkpoint: Path, run: Path) -> Path:
-    out = run / "heads" / "universalXAS" / UNIVERSAL_VARIANT
+def train_universal_candidate(
+    setting: dict[str, Any],
+    features: Path,
+    e2e_checkpoint: Path,
+    run: Path,
+) -> Path:
+    out = run / "heads" / "universalXAS" / setting["name"]
     checkpoint = best_checkpoint(out)
     if checkpoint is not None:
         print(f"reusing UniversalXAS checkpoint: {checkpoint}", flush=True)
         return checkpoint
-    ensure_clean_or_complete(out, "UniversalXAS")
-    pl.seed_everything(UNIVERSAL_SEED, workers=True)
+    ensure_clean_or_complete(out, f"UniversalXAS {setting['name']}")
+    pl.seed_everything(setting["seed"], workers=True)
     universal = build_head_regressor(
         out,
-        lr=UNIVERSAL_LR,
-        dropout=UNIVERSAL_DROPOUT,
-        batch=HEAD_BATCH_SIZE,
-        epochs=UNIVERSAL_EPOCHS,
-        patience=UNIVERSAL_PATIENCE,
-        scheduler="plateau",
-        cosine_t=UNIVERSAL_EPOCHS,
-        plateau_factor=UNIVERSAL_PLATEAU_FACTOR,
-        plateau_patience=UNIVERSAL_PLATEAU_PATIENCE,
+        lr=setting["lr"],
+        dropout=setting["dropout"],
+        batch=setting["batch_size"],
+        epochs=setting["epochs"],
+        patience=setting["early_stopping_patience"],
+        scheduler=setting["scheduler"],
+        cosine_t=setting["epochs"],
+        plateau_factor=setting["plateau_factor"],
+        plateau_patience=setting["plateau_patience"],
     )
     universal.model.model.load_state_dict(head_state_from_e2e(e2e_checkpoint), strict=True)
     universal.fit(universal_split(features))
     return Path(universal.cfg.fetch_checkpoint("best"))
+
+
+def evaluate_universal_sweep(
+    features: Path,
+    e2e_checkpoint: Path,
+    run: Path,
+) -> list[dict[str, Any]]:
+    rows = []
+    for setting in UNIVERSAL_SWEEP:
+        checkpoint = train_universal_candidate(setting, features, e2e_checkpoint, run)
+        for task in FEFF_TASKS:
+            split = load_feature_split(features, task)
+            row = {
+                "dataset": task,
+                "variant": setting["name"],
+                "seed": setting["seed"],
+                "dropout": setting["dropout"],
+                "lr": setting["lr"],
+                "scheduler": setting["scheduler"],
+                "checkpoint": str(checkpoint),
+                "val_loss_score": checkpoint_score(checkpoint),
+            }
+            row.update(evaluate_head(checkpoint, split, "val"))
+            row.update(evaluate_head(checkpoint, split, "test"))
+            rows.append(row)
+            print(
+                f"universal {task} {setting['name']}: "
+                f"val_eta={row['val_eta']:.4f} test_eta={row['test_eta']:.4f}",
+                flush=True,
+            )
+    csv_write(run / "universal_validation_candidates.csv", rows)
+    csv_write(run / "universal_eval.csv", rows)
+    if len(rows) != len(UNIVERSAL_SWEEP) * len(FEFF_TASKS):
+        raise RuntimeError(f"Expected 24 UniversalXAS candidates, found {len(rows)}")
+    return rows
+
+
+def select_universal(rows: list[dict[str, Any]], run: Path) -> dict[str, dict[str, Any]]:
+    selected = {}
+    for task in FEFF_TASKS:
+        candidates = [row for row in rows if row["dataset"] == task]
+        if len(candidates) != len(UNIVERSAL_SWEEP):
+            raise RuntimeError(f"Expected one UniversalXAS row per variant for {task}")
+        selected[task] = max(candidates, key=lambda row: row["val_eta"])
+    csv_write(run / "universal_selected_by_dataset.csv", list(selected.values()))
+    return selected
 
 
 def evaluate_head(checkpoint: Path, split: MLSplits, split_name: str) -> dict[str, float]:
@@ -566,74 +731,102 @@ def evaluate_head(checkpoint: Path, split: MLSplits, split_name: str) -> dict[st
     }
 
 
-def evaluate_universal(checkpoint: Path, features: Path, run: Path) -> None:
-    rows = []
+def train_tuned_candidate(
+    setting: dict[str, Any],
+    task: str,
+    selected_universal: dict[str, Any],
+    features: Path,
+    run: Path,
+) -> Path:
+    out = (
+        run
+        / "heads"
+        / "tunedUniversalXAS"
+        / task
+        / selected_universal["variant"]
+        / setting["name"]
+    )
+    tuned_checkpoint = best_checkpoint(out)
+    if tuned_checkpoint is not None:
+        print(f"reusing tuned checkpoint for {task}: {tuned_checkpoint}", flush=True)
+        return tuned_checkpoint
+    ensure_clean_or_complete(out, f"Tuned-UniversalXAS {task} {setting['name']}")
+    pl.seed_everything(setting["seed"], workers=True)
+    source_dir = Path(selected_universal["checkpoint"]).parent
+    tuned = build_head_regressor(
+        source_dir,
+        lr=setting["lr"],
+        dropout=setting["dropout"],
+        batch=setting["batch_size"],
+        epochs=setting["epochs"],
+        patience=setting["patience"],
+        scheduler="cosine",
+        cosine_t=setting["cosine_t"],
+    )
+    tuned.load("best")
+    tuned.cfg.directory = str(out)
+    out.mkdir(parents=True, exist_ok=True)
+    tuned.fit(load_feature_split(features, task))
+    return Path(tuned.cfg.fetch_checkpoint("best"))
+
+
+def evaluate_tuned_sweep(
+    features: Path,
+    selected_universal: dict[str, dict[str, Any]],
+    run: Path,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    validation_rows = []
     for task in FEFF_TASKS:
+        universal = selected_universal[task]
         split = load_feature_split(features, task)
-        row = {
-            "dataset": task,
-            "variant": UNIVERSAL_VARIANT,
-            "checkpoint": str(checkpoint),
-            "val_loss_score": checkpoint_score(checkpoint),
-        }
-        row.update(evaluate_head(checkpoint, split, "val"))
-        row.update(evaluate_head(checkpoint, split, "test"))
-        rows.append(row)
-        print(
-            f"universal {task}: val_eta={row['val_eta']:.4f} "
-            f"test_eta={row['test_eta']:.4f}",
-            flush=True,
-        )
-    csv_write(run / "universal_eval.csv", rows)
-
-
-def train_tuned(checkpoint: Path, features: Path, run: Path) -> None:
-    source_dir = checkpoint.parent
-    setting = TUNED_SETTING
-    rows = []
-    for task in FEFF_TASKS:
-        setting_name = f"{setting['name']}_seed{setting['seed']}"
-        out = run / "heads" / "tunedUniversalXAS" / task / setting_name
-        tuned_checkpoint = best_checkpoint(out)
-        if tuned_checkpoint is None:
-            ensure_clean_or_complete(out, f"Tuned-UniversalXAS {task}")
-            pl.seed_everything(setting["seed"], workers=True)
-            tuned = build_head_regressor(
-                source_dir,
-                lr=setting["lr"],
-                dropout=setting["dropout"],
-                batch=setting["batch_size"],
-                epochs=setting["epochs"],
-                patience=setting["patience"],
-                scheduler="cosine",
-                cosine_t=setting["cosine_t"],
+        for setting in TUNED_SWEEP:
+            checkpoint = train_tuned_candidate(setting, task, universal, features, run)
+            row = {
+                "dataset": task,
+                "setting": setting["name"],
+                "seed": setting["seed"],
+                "dropout": setting["dropout"],
+                "lr": setting["lr"],
+                "scheduler": "cosine",
+                "cosine_t": setting["cosine_t"],
+                "eta_min": E2E_MIN_LR,
+                "batch_size": HEAD_BATCH_SIZE,
+                "selected_universal_variant": universal["variant"],
+                "selected_universal_checkpoint": universal["checkpoint"],
+                "checkpoint": str(checkpoint),
+                "val_loss_score": checkpoint_score(checkpoint),
+            }
+            row.update(evaluate_head(checkpoint, split, "val"))
+            validation_rows.append(row)
+            print(
+                f"tuned {task} {setting['name']}: "
+                f"val_eta={row['val_eta']:.4f}",
+                flush=True,
             )
-            tuned.load("best")
-            tuned.cfg.directory = str(out)
-            out.mkdir(parents=True, exist_ok=True)
-            tuned.fit(load_feature_split(features, task))
-            tuned_checkpoint = Path(tuned.cfg.fetch_checkpoint("best"))
-        else:
-            print(f"reusing tuned checkpoint for {task}: {tuned_checkpoint}", flush=True)
-        split = load_feature_split(features, task)
-        row = {
-            "dataset": task,
-            "setting": setting["name"],
-            "seed": setting["seed"],
-            "dropout": setting["dropout"],
-            "lr": setting["lr"],
-            "checkpoint": str(tuned_checkpoint),
-            "val_loss_score": checkpoint_score(tuned_checkpoint),
-        }
-        row.update(evaluate_head(tuned_checkpoint, split, "val"))
-        row.update(evaluate_head(tuned_checkpoint, split, "test"))
-        rows.append(row)
+    expected = len(FEFF_TASKS) * len(TUNED_SWEEP)
+    if len(validation_rows) != expected:
+        raise RuntimeError(f"Expected {expected} tuned candidates, found {len(validation_rows)}")
+    csv_write(run / "tuned_validation_candidates.csv", validation_rows)
+
+    selected_tuned = []
+    for task in FEFF_TASKS:
+        candidates = [row for row in validation_rows if row["dataset"] == task]
+        if len(candidates) != len(TUNED_SWEEP):
+            raise RuntimeError(f"Expected one tuned row per setting for {task}")
+        selected = max(candidates, key=lambda row: row["val_eta"])
+        test_metrics = evaluate_head(
+            Path(selected["checkpoint"]),
+            load_feature_split(features, task),
+            "test",
+        )
+        selected_tuned.append(selected | test_metrics)
         print(
-            f"tuned {task}: val_eta={row['val_eta']:.4f} "
-            f"test_eta={row['test_eta']:.4f}",
+            f"selected tuned {task} {selected['setting']}: "
+            f"val_eta={selected['val_eta']:.4f} test_eta={test_metrics['test_eta']:.4f}",
             flush=True,
         )
-    csv_write(run / "tuned_eval.csv", rows)
+    csv_write(run / "tuned_eval.csv", selected_tuned)
+    return validation_rows, selected_tuned
 
 
 def save_settings(
@@ -655,6 +848,7 @@ def save_settings(
         "train_rows_by_task": counts,
         "total_train_rows": sum(counts.values()),
         "e2e_train_batch_size": balanced_batch_size,
+        "head_batch_size": HEAD_BATCH_SIZE,
         "eval_export_batch_size": ENCODER_BATCH,
         "balanced_batch_size": balanced_batch_size,
         "rows_per_element": args.rows_per_element,
@@ -669,23 +863,20 @@ def save_settings(
         "e2e_monitor": "val_balanced_rel_mse",
         "e2e_derivative_lambda": ENCODER_DERIV_LAMBDA,
         "inverse_dataset_size_loss_weights": False,
-        "universal_variant": UNIVERSAL_VARIANT,
-        "universal_settings": {
-            "seed": UNIVERSAL_SEED,
-            "dropout": UNIVERSAL_DROPOUT,
-            "lr": UNIVERSAL_LR,
-            "scheduler": "plateau",
-            "plateau_factor": UNIVERSAL_PLATEAU_FACTOR,
-            "base_plateau_patience": UNIVERSAL_PLATEAU_PATIENCE,
-            "min_lr": E2E_MIN_LR,
-            "epochs": UNIVERSAL_EPOCHS,
-            "early_stopping_patience": UNIVERSAL_PATIENCE,
-            "batch_size": HEAD_BATCH_SIZE,
-            "loader": "standard_full_feature_loader",
-            "monitor": "val_median_mse",
+        "universal_sweep": UNIVERSAL_SWEEP,
+        "tuned_sweep": TUNED_SWEEP,
+        "selection_policies": {
+            "universal": "select maximum validation eta per FEFF task",
+            "tuned": "select maximum validation eta per FEFF task, then evaluate test once",
+            "universal_candidates": len(UNIVERSAL_SWEEP) * len(FEFF_TASKS),
+            "tuned_candidates": len(TUNED_SWEEP) * len(FEFF_TASKS),
         },
         "universal_loader": "standard_full_feature_loader",
-        "tuned_setting": TUNED_SETTING,
+        "evaluation_outputs": {
+            "universal_eval.csv": "all 24 UniversalXAS candidates with validation and test metrics",
+            "tuned_validation_candidates.csv": "all 64 tuned candidates with validation metrics only",
+            "tuned_eval.csv": "one validation-selected tuned checkpoint per FEFF task with test metrics",
+        },
     }
     path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
 
@@ -787,18 +978,31 @@ def main() -> None:
     )
     evaluate_e2e(e2e_checkpoint, root, raw_root, run, args)
     features = export_features(run, e2e_checkpoint, root, raw_root, args)
-    universal_checkpoint = train_universal(features, e2e_checkpoint, run)
-    evaluate_universal(universal_checkpoint, features, run)
-    train_tuned(universal_checkpoint, features, run)
+    universal_candidates = evaluate_universal_sweep(features, e2e_checkpoint, run)
+    selected_universal = select_universal(universal_candidates, run)
+    _, selected_tuned = evaluate_tuned_sweep(features, selected_universal, run)
     (run / "RUN_COMPLETE.json").write_text(
         json.dumps(
             {
                 "status": "complete",
                 "pipeline": "balanced_e2e_feff",
                 "e2e_checkpoint": str(e2e_checkpoint),
-                "universal_checkpoint": str(universal_checkpoint),
-                "tuned_setting": TUNED_SETTING,
-                "outputs": ["e2e_eval.csv", "universal_eval.csv", "tuned_eval.csv"],
+                "universal_selected_checkpoints": {
+                    task: row["checkpoint"] for task, row in selected_universal.items()
+                },
+                "tuned_selected_checkpoints": {
+                    row["dataset"]: row["checkpoint"] for row in selected_tuned
+                },
+                "universal_selection": "validation eta only",
+                "tuned_selection": "validation eta only, test evaluated once",
+                "outputs": [
+                    "e2e_eval.csv",
+                    "universal_eval.csv",
+                    "universal_validation_candidates.csv",
+                    "universal_selected_by_dataset.csv",
+                    "tuned_validation_candidates.csv",
+                    "tuned_eval.csv",
+                ],
             },
             indent=2,
         ),
