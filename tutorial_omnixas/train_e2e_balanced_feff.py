@@ -15,6 +15,7 @@ import os
 import random
 import shutil
 from datetime import datetime
+from numbers import Integral
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -420,8 +421,34 @@ def task_baselines(
     return torch.tensor(train_base), torch.tensor(val_base), counts
 
 
-def ensure_clean_or_complete(directory: Path, label: str) -> None:
+def resume_sampler_epoch(checkpoint: Path) -> int:
+    try:
+        state = torch_load(checkpoint)
+    except Exception as exc:
+        raise ValueError(f"Cannot read resume checkpoint: {checkpoint}") from exc
+    if not isinstance(state, dict) or "epoch" not in state:
+        raise ValueError(f"Resume checkpoint is missing epoch: {checkpoint}")
+    saved_epoch = state["epoch"]
+    if isinstance(saved_epoch, bool) or not isinstance(saved_epoch, Integral):
+        raise ValueError(
+            f"Resume checkpoint has malformed epoch {saved_epoch!r}: {checkpoint}"
+        )
+    if saved_epoch < 0:
+        raise ValueError(
+            f"Resume checkpoint has invalid negative epoch {saved_epoch}: {checkpoint}"
+        )
+    return int(saved_epoch) + 1
+
+
+def ensure_clean_or_complete(
+    directory: Path,
+    label: str,
+    *,
+    allow_last: bool = False,
+) -> None:
     checkpoint = best_checkpoint(directory)
+    if checkpoint is None and allow_last and (directory / "last.ckpt").is_file():
+        return
     if checkpoint is None and directory.exists() and any(directory.iterdir()):
         raise RuntimeError(f"Incomplete {label} exists without a best checkpoint: {directory}")
 
@@ -459,10 +486,27 @@ def train_e2e(
     if copied.is_file():
         print(f"reusing end-to-end checkpoint: {copied}", flush=True)
         return copied
-    ensure_clean_or_complete(run / "checkpoints", "E2E checkpoints")
+    checkpoint_dir = run / "checkpoints"
+    resume_checkpoint = checkpoint_dir / "last.ckpt" if args.resume else None
+    if resume_checkpoint is not None and not resume_checkpoint.is_file():
+        raise FileNotFoundError(
+            f"Cannot resume E2E training without last checkpoint: {resume_checkpoint}"
+        )
+    ensure_clean_or_complete(
+        checkpoint_dir,
+        "E2E checkpoints",
+        allow_last=args.resume,
+    )
+    next_sampler_epoch = (
+        resume_sampler_epoch(resume_checkpoint)
+        if resume_checkpoint is not None
+        else None
+    )
     model = EndToEndUniversal(args.gnn_dropout, args.e2e_head_dropout)
     collate = CollateGraphs(model.encoder)
     sampler = BalancedTaskBatchSampler(train_dataset.rows, args.rows_per_element, args.seed)
+    if next_sampler_epoch is not None:
+        sampler.epoch = next_sampler_epoch
     train_loader = DataLoader(
         train_dataset,
         batch_sampler=sampler,
@@ -512,7 +556,11 @@ def train_e2e(
         logger=CSVLogger(save_dir=str(run), name="e2e_logs"),
         log_every_n_steps=1,
     )
-    trainer.fit(module, train_loader, val_loader)
+    if resume_checkpoint is not None:
+        print(f"resuming E2E training from checkpoint: {resume_checkpoint}", flush=True)
+        trainer.fit(module, train_loader, val_loader, ckpt_path=str(resume_checkpoint))
+    else:
+        trainer.fit(module, train_loader, val_loader)
     if not checkpoint.best_model_path:
         raise RuntimeError("E2E training finished without a best checkpoint")
     shutil.copy2(checkpoint.best_model_path, copied)
