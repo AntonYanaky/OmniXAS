@@ -117,10 +117,15 @@ class Head(nn.Sequential):
         layers: list[nn.Module] = []
         dims = [INPUT_DIM, *WIDTHS, OUTPUT_DIM]
         for index, (left, right) in enumerate(zip(dims, dims[1:])):
-            layers.append(nn.Linear(left, right))
+            linear = nn.Linear(left, right)
+            if variant == "selu":
+                with torch.no_grad():
+                    linear.weight.normal_(0.0, 1.0 / math.sqrt(left))
+                    linear.bias.zero_()
+            layers.append(linear)
             if index < len(WIDTHS):
                 if variant == "selu":
-                    layers.extend([nn.SELU(), nn.Dropout(dropout)])
+                    layers.extend([nn.SELU(), nn.AlphaDropout(dropout)])
                 else:
                     activation = nn.SiLU() if variant == "silu" else nn.GELU()
                     layers.extend([nn.BatchNorm1d(right), activation, nn.Dropout(dropout)])
@@ -132,11 +137,56 @@ class Head(nn.Sequential):
 class E2E(nn.Module):
     def __init__(self, variant: str):
         super().__init__()
+        self.variant = variant
         self.encoder = ScratchEncoder(.10)
         self.head = Head(variant)
+        if variant == "selu":
+            self.register_buffer("feature_mean", torch.zeros(INPUT_DIM))
+            self.register_buffer("feature_std", torch.ones(INPUT_DIM))
+
+    def transform_features(self, encoder_output: torch.Tensor) -> torch.Tensor:
+        features = encoder_output * SCALE
+        if self.variant == "selu":
+            features = (features - self.feature_mean) / self.feature_std
+        return features
 
     def forward(self, graph, site):
-        return self.head(self.encoder(graph, site) * SCALE)
+        return self.head(self.transform_features(self.encoder(graph, site)))
+
+    def rebase_features(self, mean: torch.Tensor, std: torch.Tensor) -> None:
+        with torch.no_grad():
+            self.head[0].bias.add_(self.head[0].weight @ mean)
+            self.head[0].weight.mul_(std)
+            self.feature_mean.add_(self.feature_std * mean)
+            self.feature_std.mul_(std)
+
+
+def training_feature_stats(model: E2E, train: FEFFDataset) -> tuple[torch.Tensor, torch.Tensor]:
+    """Measure transformed features from the training data."""
+    if model.variant != "selu":
+        raise ValueError("Feature standardization is only defined for SELU")
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    collate = CollateGraphs(model.encoder)
+    loader = DataLoader(train, batch_size=ENCODER_BATCH, collate_fn=collate)
+    was_training = model.encoder.training
+    model.encoder.eval()
+    try:
+        with torch.inference_mode():
+            values = [model.transform_features(model.encoder(
+                batch["graph"].to(device), batch["site"].to(device))).cpu() for batch in loader]
+    finally:
+        model.encoder.train(was_training)
+        model.cpu()
+    if not values:
+        raise ValueError("Training feature dataset is empty")
+    features = torch.cat(values)
+    if features.ndim != 2 or features.shape[1] != INPUT_DIM or not torch.isfinite(features).all():
+        raise ValueError("Training features are non-finite or have an invalid shape")
+    mean, std = features.mean(0), features.std(0, unbiased=False)
+    if not torch.isfinite(std).all() or (std <= 1e-8).any():
+        raise ValueError("Training feature standard deviation is invalid")
+    return mean, std
 
 
 class E2ELightning(pl.LightningModule):
@@ -263,13 +313,18 @@ def mark_done(job: Path) -> None:
 
 def train_e2e(run: Path, raw: Path, variant: str, train_base: torch.Tensor, val_base: torch.Tensor) -> Path:
     job = run / "e2e"
+    best = job / "best.ckpt"
     if done(job, ["best.ckpt", "last.ckpt"]):
-        return job / "best.ckpt"
+        return best
     job.mkdir(parents=True, exist_ok=True)
     pl.seed_everything(44, workers=True)
     model = E2E(variant)
-    collate = CollateGraphs(model.encoder)
     train = FEFFDataset(ROOT, raw, TASKS, "train")
+    if variant == "selu":
+        feature_mean, feature_std = training_feature_stats(model, train)
+        model.feature_mean.copy_(feature_mean)
+        model.feature_std.copy_(feature_std)
+    collate = CollateGraphs(model.encoder)
     sampler = BalancedSampler([row[0] for row in train.rows], 48, 44)
     full_updates = math.ceil(len(train) / 48)
     scale = full_updates / len(sampler)
@@ -280,10 +335,20 @@ def train_e2e(run: Path, raw: Path, variant: str, train_base: torch.Tensor, val_
                          callbacks=[callback, EarlyStopping(monitor="val_balanced_rel_mse", mode="min", patience=max(1, round(60 * scale)))],
                          logger=CSVLogger(str(job), name="logs"), num_sanity_val_steps=0)
     trainer.fit(E2ELightning(model, train_base, val_base, max(1, round(8 * scale))), loader, validation)
-    if not callback.best_model_path:
+    if not callback.best_model_path or not best.is_file():
         raise RuntimeError("E2E training did not produce a best checkpoint")
+    if variant == "selu":
+        checkpoint = torch_load(best)
+        state = checkpoint.get("state_dict", {})
+        model = E2E(variant)
+        model.load_state_dict({key.removeprefix("model."): value for key, value in state.items()
+                               if key.startswith("model.")}, strict=True)
+        mean, std = training_feature_stats(model, train)
+        model.rebase_features(mean, std)
+        checkpoint["state_dict"].update({f"model.{key}": value for key, value in model.state_dict().items()})
+        torch.save(checkpoint, best)
     mark_done(job)
-    return job / "best.ckpt"
+    return best
 
 
 def load_head_state(checkpoint: Path, prefix: str) -> dict[str, torch.Tensor]:
@@ -315,7 +380,8 @@ def export_features(run: Path, raw: Path, e2e: Path, variant: str) -> Path:
                 loader = DataLoader(FEFFDataset(ROOT, raw, [task], split), batch_size=ENCODER_BATCH, collate_fn=collate)
                 xs, ys = [], []
                 for batch in loader:
-                    xs.append((model.encoder(batch["graph"].to(device), batch["site"].to(device)) * SCALE).cpu().numpy())
+                    xs.append(model.transform_features(
+                        model.encoder(batch["graph"].to(device), batch["site"].to(device))).cpu().numpy())
                     ys.append(batch["y"].numpy())
                 X, exported_y = np.concatenate(xs), np.concatenate(ys)
                 _, y = canonical_rows(task, split)
@@ -407,10 +473,17 @@ def universal_and_tuned(run: Path, features: Path, e2e: Path, variant: str) -> N
 
 
 def settings(variant: str) -> dict[str, Any]:
-    return {"variant": variant, "dimensions": [64, 500, 500, 550, 141], "feature_scale": 1000.0,
+    result = {"variant": variant, "dimensions": [64, 500, 500, 550, 141], "feature_scale": 1000.0,
             "dropout": .10, "e2e": {"seed": 44, "batch_size": 48, "rows_per_element": 6, "encoder_lr": 1e-3, "head_lr": 5e-4, "weight_decay": 1e-5, "derivative_loss": .02, "max_epochs": 1000, "early_stop": 60, "plateau_factor": .5, "plateau_patience": 8, "plateau_frequency": 2, "min_lr": 1e-6},
             "universal": {"batch_sizes": [64, 128, 192], "seeds": [44, 45, 46], "lr": 5e-4, "max_epochs": 800, "early_stop": 60, "plateau_factor": .5, "plateau_patience": 8, "frequency": 2, "min_lr": 1e-6, "validation_frequency": 2},
             "tuned": {"source_seeds": [44, 45, 46], "seeds": [145, 146, 147], "lr": 3e-4, "max_epochs": 1000, "early_stop": 60, "cosine_t_max": 500, "min_lr": 1e-6}}
+    if variant == "selu":
+        result["selu_recipe"] = {
+            "feature_standardization": "train_only_initial_and_final_rebase",
+            "initialization": "lecun_normal",
+            "dropout": "alpha_dropout",
+        }
+    return result
 
 
 def parse_args() -> argparse.Namespace:
