@@ -70,6 +70,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--preflight", "--self-check", action="store_true", help="Check inputs and architecture, then stop")
     p.add_argument("--evaluate", action="store_true", help="Evaluate completed checkpoints, without training")
     p.add_argument("--num-workers", type=int, default=0)
+    p.add_argument("--precision", choices=("32-true", "bf16-mixed"), default="32-true")
     p.add_argument("--encoder-epochs", type=int, default=DEFAULT_EPOCHS)
     p.add_argument("--encoder-rows-per-element", type=int, default=12)
     p.add_argument("--encoder-lr", type=float, default=1e-3)
@@ -141,7 +142,7 @@ class LitScratch(pl.LightningModule):
         self.val_mse, self.val_task = [], []
 
     def step(self, batch, stage):
-        pred = self.model(batch["graph"].to(self.device), batch["site"].to(self.device)); y = batch["y"].to(self.device); task = batch["task"].to(self.device)
+        pred = self.model(batch["graph"].to(self.device), batch["line_graph"].to(self.device), batch["site"].to(self.device)); y = batch["y"].to(self.device); task = batch["task"].to(self.device)
         mse = ((pred - y) ** 2).mean(1); base = self.train_base if stage == "train" else self.val_base
         loss = (mse / base[task].clamp_min(1e-12)).mean() + 0.02 * (torch.diff(pred, dim=1) - torch.diff(y, dim=1)).square().mean()
         self.log(f"{stage}_loss", loss, on_epoch=True, prog_bar=True)
@@ -180,10 +181,11 @@ def csv_write(path: Path, rows: list[dict]) -> None:
 
 
 def evaluate_head(head: XASSpectralHead, X: np.ndarray, y: np.ndarray, train_y: np.ndarray, batch: int) -> dict[str, float]:
+    device = next(head.parameters()).device
     predictions = []
     with torch.inference_mode():
         for xb in torch.from_numpy(X).split(batch):
-            predictions.append(head(xb).numpy())
+            predictions.append(head(xb.to(device, non_blocking=device.type == "cuda")).cpu().numpy())
     mse = np.mean((np.concatenate(predictions) - y) ** 2, axis=1)
     baseline = np.median(np.mean((y - train_y.mean(0)) ** 2, axis=1))
     return {
@@ -223,15 +225,21 @@ def train_head(out: Path, X: np.ndarray, y: np.ndarray, val_X: np.ndarray, val_y
         raise RuntimeError(f"Head directory is incomplete and will not be reused: {out}")
     out.mkdir(parents=True, exist_ok=True)
     if checkpoint.exists(): return checkpoint
-    head = XASSpectralHead();
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    head = XASSpectralHead()
     if source is not None: head.load_state_dict(source, strict=True)
+    head.to(device)
     opt = torch.optim.AdamW(head.parameters(), lr=args.head_lr, weight_decay=1e-5); best = float("inf"); stale = 0
-    loader = DataLoader(TensorDataset(torch.tensor(X), torch.tensor(y)), batch_size=args.batch_size, shuffle=True)
+    loader = DataLoader(TensorDataset(torch.tensor(X), torch.tensor(y)), batch_size=args.batch_size, shuffle=True, pin_memory=device.type == "cuda")
+    val_X_tensor = torch.tensor(val_X).to(device)
+    val_y_tensor = torch.tensor(val_y).to(device)
     for epoch in range(args.head_epochs):
         head.train()
-        for xb, yb in loader: opt.zero_grad(); loss = (head(xb) - yb).square().mean(); loss.backward(); opt.step()
+        for xb, yb in loader:
+            xb, yb = xb.to(device, non_blocking=device.type == "cuda"), yb.to(device, non_blocking=device.type == "cuda")
+            opt.zero_grad(); loss = (head(xb) - yb).square().mean(); loss.backward(); opt.step()
         head.eval()
-        with torch.inference_mode(): val = float((head(torch.tensor(val_X)) - torch.tensor(val_y)).square().mean())
+        with torch.inference_mode(): val = float((head(val_X_tensor) - val_y_tensor).square().mean())
         if val < best: best, stale = val, 0; torch.save({"state_dict": head.state_dict(), "epoch": epoch, "val_loss": val}, checkpoint)
         else: stale += 1
         if stale >= args.head_patience: break
@@ -247,7 +255,8 @@ def load_state(path: Path) -> dict:
 
 
 def write_evaluations(run: Path, features: Path, args: argparse.Namespace) -> None:
-    universal_head = XASSpectralHead()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    universal_head = XASSpectralHead().to(device)
     universal_checkpoint = run / "heads/universalXAS/best.pt"
     universal_head.load_state_dict(load_state(universal_checkpoint), strict=True)
     universal_head.eval()
@@ -261,7 +270,7 @@ def write_evaluations(run: Path, features: Path, args: argparse.Namespace) -> No
         universal_test.append({"dataset": task, "variant": "UniversalXAS", **{f"test_{k}": v for k, v in test.items()}})
 
         checkpoint = run / f"heads/tunedUniversalXAS/{task}/best.pt"
-        tuned_head = XASSpectralHead()
+        tuned_head = XASSpectralHead().to(device)
         tuned_head.load_state_dict(load_state(checkpoint), strict=True)
         tuned_head.eval()
         tuned_validation.append({"dataset": task, "checkpoint": str(checkpoint), **evaluate_head(tuned_head, split.val.X, split.val.y, split.train.y, args.batch_size)})
@@ -324,16 +333,17 @@ def main() -> None:
             "args": vars(args),
         }, indent=2), encoding="utf-8")
     train_base, val_base = baselines(root)
+    graph_loader_kwargs = {"num_workers": args.num_workers, "pin_memory": torch.cuda.is_available(), "persistent_workers": args.num_workers > 0}
     encoder_path = run / "best_encoder.ckpt"
     if not encoder_path.exists():
         model = M3GNetXAS(); collate = CollateGraphs(model.encoder); train_ds = FEFFDataset(root, raw, FEFF_TASKS, "train")
         task_counts = {task: sum(row[0] == task for row in train_ds.rows) for task in FEFF_TASKS}
         rows_per_element = min(args.encoder_rows_per_element, min(task_counts.values()))
         sampler = BalancedTaskBatchSampler(train_ds.rows, rows_per_element, args.seed)
-        train_loader = DataLoader(train_ds, batch_sampler=sampler, collate_fn=collate, num_workers=args.num_workers)
-        val_loader = DataLoader(FEFFDataset(root, raw, FEFF_TASKS, "val"), batch_size=ENCODER_BATCH, collate_fn=collate, num_workers=args.num_workers)
+        train_loader = DataLoader(train_ds, batch_sampler=sampler, collate_fn=collate, **graph_loader_kwargs)
+        val_loader = DataLoader(FEFFDataset(root, raw, FEFF_TASKS, "val"), batch_size=ENCODER_BATCH, collate_fn=collate, **graph_loader_kwargs)
         cb = ModelCheckpoint(run / "encoder_checkpoints", filename="best-{epoch:03d}-{val_balanced_rel_mse:.5f}", monitor="val_balanced_rel_mse", mode="min", save_top_k=1, save_last=True)
-        trainer = pl.Trainer(max_epochs=args.encoder_epochs, accelerator="auto", devices=1, callbacks=[cb, EarlyStopping(monitor="val_balanced_rel_mse", patience=30, mode="min")], logger=CSVLogger(str(run), name="encoder_logs"), log_every_n_steps=1)
+        trainer = pl.Trainer(max_epochs=args.encoder_epochs, accelerator="auto", devices=1, precision=args.precision, callbacks=[cb, EarlyStopping(monitor="val_balanced_rel_mse", patience=30, mode="min")], logger=CSVLogger(str(run), name="encoder_logs"), log_every_n_steps=1)
         trainer.fit(LitScratch(model, train_base, val_base, args.encoder_lr, args.encoder_epochs), train_loader, val_loader, ckpt_path=str(run / "encoder_checkpoints/last.ckpt") if args.resume and (run / "encoder_checkpoints/last.ckpt").exists() else None)
         if not cb.best_model_path: raise RuntimeError("Encoder training produced no validation checkpoint")
         shutil.copy2(cb.best_model_path, encoder_path)
@@ -344,9 +354,9 @@ def main() -> None:
     model = M3GNetXAS(); state = torch.load(encoder_path, map_location="cpu", weights_only=False)["state_dict"]; model.load_state_dict({k.removeprefix("model."): v for k, v in state.items() if k.startswith("model.")}, strict=True); model.eval(); device = torch.device("cuda" if torch.cuda.is_available() else "cpu"); model.to(device); collate = CollateGraphs(model.encoder)
     with torch.inference_mode():
         for task, split in missing:
-            loader = DataLoader(FEFFDataset(root, raw, [task], split), batch_size=ENCODER_BATCH, collate_fn=collate, num_workers=args.num_workers); xs, ys = [], []
+            loader = DataLoader(FEFFDataset(root, raw, [task], split), batch_size=ENCODER_BATCH, collate_fn=collate, **graph_loader_kwargs); xs, ys = [], []
             for b in loader:
-                xs.append(model.encode(b["graph"].to(device), b["site"].to(device), scaled=True).cpu().numpy())
+                xs.append(model.encode(b["graph"].to(device), b["line_graph"].to(device), b["site"].to(device), scaled=True).cpu().numpy())
                 ys.append(b["y"].numpy())
             X, y = np.concatenate(xs), np.concatenate(ys); np.savetxt(features / f"{task}_{split}_X.txt", X); np.savetxt(features / f"{task}_{split}_y.txt", y)
     validate_features(features, root)

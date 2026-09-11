@@ -13,7 +13,6 @@ import torch
 from torch import nn
 
 from matgl.config import DEFAULT_ELEMENTS
-from matgl.graph.compute import compute_theta_and_phi, create_line_graph
 from matgl.layers import (
     MLP as M3GNetMLP,
     ActivationFunction,
@@ -143,17 +142,12 @@ class M3GNetXASEncoder(nn.Module):
             ]
         )
 
-    def forward(self, graph, site: torch.Tensor) -> torch.Tensor:
+    def forward(self, graph, line_graph, site: torch.Tensor) -> torch.Tensor:
         bond_distances = graph.edata["bond_dist"]
         radial_basis = self.bond_expansion(bond_distances)
         graph.edata["rbf"] = radial_basis
 
-        # MatGL 0.8.5 only constructs line graphs on the CPU. Move the result
-        # back so the remaining operations stay on the model's device.
-        line_graph = create_line_graph(graph.to("cpu"), self.threebody_cutoff)
         line_graph = line_graph.to(graph.device)
-        line_graph.apply_edges(compute_theta_and_phi)
-
         three_body_basis = self.basis_expansion(line_graph)
         three_body_cutoff = polynomial_cutoff(
             bond_distances, self.threebody_cutoff
@@ -202,13 +196,16 @@ class M3GNetXAS(nn.Module):
     def encode(
         self,
         graph,
+        line_graph,
         site: torch.Tensor,
         *,
         scaled: bool = False,
     ) -> torch.Tensor:
         """Return the absorbing-site features, optionally in head-training scale."""
-        features = self.encoder(graph, site)
+        if line_graph is None:
+            raise ValueError("line_graph is required")
+        features = self.encoder(graph, line_graph, site)
         return features * self.feature_scale if scaled else features
 
-    def forward(self, graph, site: torch.Tensor) -> torch.Tensor:
-        return self.head(self.encode(graph, site, scaled=True))
+    def forward(self, graph, line_graph, site: torch.Tensor) -> torch.Tensor:
+        return self.head(self.encode(graph, line_graph, site, scaled=True))

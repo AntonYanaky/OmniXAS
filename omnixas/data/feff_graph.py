@@ -9,9 +9,17 @@ import numpy as np
 import torch
 from matgl.ext.pymatgen import Structure2Graph
 try:
-    from matgl.graph.compute import compute_pair_vector_and_distance
+    from matgl.graph.compute import (
+        compute_pair_vector_and_distance,
+        compute_theta_and_phi,
+        create_line_graph,
+    )
 except ImportError:
-    from matgl.graph._compute_dgl import compute_pair_vector_and_distance
+    from matgl.graph._compute_dgl import (
+        compute_pair_vector_and_distance,
+        compute_theta_and_phi,
+        create_line_graph,
+    )
 from pymatgen.core import Lattice, Structure
 from torch.utils.data import Dataset, Sampler
 
@@ -145,6 +153,7 @@ class FEFFDataset(Dataset):
 class CollateGraphs:
     def __init__(self, encoder):
         self.converter = Structure2Graph(encoder.element_types, encoder.cutoff)
+        self.threebody_cutoff = encoder.threebody_cutoff
         self.task_idx = {task: i for i, task in enumerate(FEFF_TASKS)}
 
     def graph(self, structure: Structure):
@@ -168,16 +177,25 @@ class CollateGraphs:
         return graph
 
     def __call__(self, batch):
-        graphs, sites, tasks, y = [], [], [], []
+        graphs, line_graphs, sites, tasks, y = [], [], [], [], []
         offset = 0
         for task, structure, site, yi in batch:
             graph = self.graph(structure)
+            line_graph = create_line_graph(graph.to("cpu"), self.threebody_cutoff)
+            line_graph.apply_edges(compute_theta_and_phi)
             graphs.append(graph)
+            line_graphs.append(line_graph)
             sites.append(offset + site)
             tasks.append(self.task_idx[task])
             y.append(yi)
             offset += graph.num_nodes()
-        return {"graph": dgl.batch(graphs), "site": torch.tensor(sites), "task": torch.tensor(tasks), "y": torch.stack(y).float()}
+        return {
+            "graph": dgl.batch(graphs),
+            "line_graph": dgl.batch(line_graphs),
+            "site": torch.tensor(sites),
+            "task": torch.tensor(tasks),
+            "y": torch.stack(y).float(),
+        }
 
 
 def load_feature_split(features: Path, task: str) -> MLSplits:
