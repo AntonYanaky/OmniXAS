@@ -333,7 +333,9 @@ def main() -> None:
             "args": vars(args),
         }, indent=2), encoding="utf-8")
     train_base, val_base = baselines(root)
-    graph_loader_kwargs = {"num_workers": args.num_workers, "pin_memory": torch.cuda.is_available(), "persistent_workers": args.num_workers > 0}
+    graph_loader_kwargs = {"num_workers": args.num_workers}
+    if args.num_workers > 0:
+        graph_loader_kwargs.update(persistent_workers=True, prefetch_factor=1)
     encoder_path = run / "best_encoder.ckpt"
     if not encoder_path.exists():
         model = M3GNetXAS(); collate = CollateGraphs(model.encoder); train_ds = FEFFDataset(root, raw, FEFF_TASKS, "train")
