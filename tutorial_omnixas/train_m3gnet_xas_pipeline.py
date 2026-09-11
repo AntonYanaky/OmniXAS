@@ -128,7 +128,7 @@ def preflight(root: Path, raw: Path) -> None:
     model = M3GNetXAS()
     params = sum(p.numel() for p in model.parameters())
     head_params = sum(p.numel() for p in XASSpectralHead().parameters())
-    print(json.dumps({"tasks": FEFF_TASKS, "train_rows": counts, "feature_dim": FEATURE_DIM, "spectrum_dim": SPECTRUM_DIM, "encoder_parameters": params, "head_parameters": head_params, "raw_root": str(raw), "raw_root_exists": raw.is_dir()}, indent=2))
+    print(json.dumps({"train_rows": sum(counts.values()), "feature_dim": FEATURE_DIM, "spectrum_dim": SPECTRUM_DIM, "encoder_parameters": params, "head_parameters": head_params, "raw_root": str(raw), "raw_root_exists": raw.is_dir()}, indent=2))
     if not raw.is_dir():
         raise FileNotFoundError(f"Missing raw FEFF structure root: {raw}. Set OMNIXAS_DATA_ROOT.")
     validate_raw_structures(root, raw, FEFF_TASKS)
