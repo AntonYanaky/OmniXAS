@@ -271,6 +271,7 @@ def write_evaluations(run: Path, features: Path, args: argparse.Namespace) -> No
     csv_write(run / "tuned_test.csv", tuned_test)
 
 def main() -> None:
+    torch.set_float32_matmul_precision("high")
     args = parse_args()
     if args.batch_size < 1:
         raise ValueError("--batch-size must be at least 1")
