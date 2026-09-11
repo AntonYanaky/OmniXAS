@@ -71,6 +71,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--evaluate", action="store_true", help="Evaluate completed checkpoints, without training")
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--encoder-epochs", type=int, default=DEFAULT_EPOCHS)
+    p.add_argument("--encoder-rows-per-element", type=int, default=12)
     p.add_argument("--encoder-lr", type=float, default=1e-3)
     p.add_argument("--head-epochs", type=int, default=800)
     p.add_argument("--head-patience", type=int, default=60)
@@ -327,7 +328,7 @@ def main() -> None:
     if not encoder_path.exists():
         model = M3GNetXAS(); collate = CollateGraphs(model.encoder); train_ds = FEFFDataset(root, raw, FEFF_TASKS, "train")
         task_counts = {task: sum(row[0] == task for row in train_ds.rows) for task in FEFF_TASKS}
-        rows_per_element = min(12, min(task_counts.values()))
+        rows_per_element = min(args.encoder_rows_per_element, min(task_counts.values()))
         sampler = BalancedTaskBatchSampler(train_ds.rows, rows_per_element, args.seed)
         train_loader = DataLoader(train_ds, batch_sampler=sampler, collate_fn=collate, num_workers=args.num_workers)
         val_loader = DataLoader(FEFFDataset(root, raw, FEFF_TASKS, "val"), batch_size=ENCODER_BATCH, collate_fn=collate, num_workers=args.num_workers)
