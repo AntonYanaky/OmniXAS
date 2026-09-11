@@ -19,6 +19,10 @@ import argparse
 import csv
 import json
 import os
+
+# DGL must receive its backend before any MatGL import loads DGL.
+os.environ.setdefault("DGLBACKEND", "pytorch")
+
 import random
 import shutil
 from pathlib import Path
@@ -39,13 +43,19 @@ from omnixas.model.m3gnet_xas import (
     XASSpectralHead,
 )
 
-from train_all8_feff import (  # existing FEFF graph and row-alignment utilities
-    CollateGraphs, FEFFDataset, FEFF_TASKS, ENCODER_BATCH, patch_matgl_gpu_constants,
-    validate_raw_structures, load_feature_split, missing_feature_splits,
+from omnixas.data.feff_graph import (
+    BalancedTaskBatchSampler,
+    CollateGraphs,
+    ENCODER_BATCH,
+    FEFFDataset,
+    FEFF_TASKS,
+    SPLITS,
+    load_feature_split,
+    missing_feature_splits,
+    patch_matgl_gpu_constants,
+    validate_raw_structures,
 )
-from train_e2e_balanced_feff import BalancedTaskBatchSampler
 
-SPLITS = ("train", "val", "test")
 DEFAULT_EPOCHS = 300
 
 
@@ -73,18 +83,7 @@ def project_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
-def data_root(root: Path) -> Path:
-    return Path(os.environ.get("OMNIXAS_DATA_ROOT", root.parent / "OmniXAS_data")) / "materialscloud_omnixas_raw" / "extracted"
-
-
-def _ids(path: Path) -> list[str]:
-    rows = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
-    if len(rows) != len(set(rows)):
-        raise ValueError(f"Duplicate full IDs in {path}")
-    return rows
-
-
-def check_arrays(root: Path) -> dict[str, int]:
+def preflight(root: Path, raw: Path) -> None:
     data = root / "tutorial_omnixas/ml_data"
     ids_dir = root / "tutorial_omnixas/material_id_and_site"
     counts: dict[str, int] = {}
@@ -108,7 +107,9 @@ def check_arrays(root: Path) -> dict[str, int]:
             id_path = ids_dir / f"{task}_{split}.txt"
             X = np.atleast_2d(np.loadtxt(x_path, dtype=np.float32))
             y = np.atleast_2d(np.loadtxt(y_path, dtype=np.float32))
-            rows = _ids(id_path)
+            rows = [line.strip() for line in id_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            if len(rows) != len(set(rows)):
+                raise ValueError(f"Duplicate full IDs in {id_path}")
             if X.shape != (len(rows), FEATURE_DIM):
                 raise ValueError(f"Feature/ID order or shape mismatch for {task} {split}: X={X.shape}, IDs={len(rows)}")
             if y.shape != (len(rows), SPECTRUM_DIM):
@@ -121,11 +122,7 @@ def check_arrays(root: Path) -> dict[str, int]:
             overlap = material_sets[f"{task}:{left}"] & material_sets[f"{task}:{right}"]
             if overlap:
                 raise ValueError(f"Material leakage in {task}: {left}/{right}, example {next(iter(overlap))}")
-    return counts
 
-
-def preflight(root: Path, raw: Path) -> None:
-    counts = check_arrays(root)
     model = M3GNetXAS()
     params = sum(p.numel() for p in model.parameters())
     head_params = sum(p.numel() for p in XASSpectralHead().parameters())
@@ -181,13 +178,19 @@ def csv_write(path: Path, rows: list[dict]) -> None:
         w = csv.DictWriter(f, fieldnames=sorted(set().union(*(r.keys() for r in rows)))); w.writeheader(); w.writerows(rows)
 
 
-def predict_head(state: dict, X: np.ndarray, y: np.ndarray, train_y: np.ndarray, batch: int) -> dict[str, float]:
-    head = XASSpectralHead(); head.load_state_dict(state, strict=True); head.eval(); pred = []
+def evaluate_head(head: XASSpectralHead, X: np.ndarray, y: np.ndarray, train_y: np.ndarray, batch: int) -> dict[str, float]:
+    predictions = []
     with torch.inference_mode():
-        for (xb,) in DataLoader(TensorDataset(torch.tensor(X)), batch_size=batch): pred.append(head(xb).numpy())
-    pred = np.concatenate(pred); mse = np.mean((pred - y) ** 2, 1); base = np.median(np.mean((y - train_y.mean(0)) ** 2, 1))
-    return {"mse": float(mse.mean()), "median_mse": float(np.median(mse)), "baseline_median_mse": float(base), "eta": float(base / max(np.median(mse), 1e-12))}
-
+        for xb in torch.from_numpy(X).split(batch):
+            predictions.append(head(xb).numpy())
+    mse = np.mean((np.concatenate(predictions) - y) ** 2, axis=1)
+    baseline = np.median(np.mean((y - train_y.mean(0)) ** 2, axis=1))
+    return {
+        "mse": float(mse.mean()),
+        "median_mse": float(np.median(mse)),
+        "baseline_median_mse": float(baseline),
+        "eta": float(baseline / max(np.median(mse), 1e-12)),
+    }
 
 def validate_features(features: Path, root: Path) -> None:
     canonical = root / "tutorial_omnixas/ml_data"
@@ -242,41 +245,35 @@ def load_state(path: Path) -> dict:
     return state["state_dict"]
 
 
-def evaluate_run(run: Path, args: argparse.Namespace) -> None:
-    if not (run / "RUN_COMPLETE.json").is_file():
-        raise RuntimeError(f"Run is not complete. Missing {run / 'RUN_COMPLETE.json'}")
-    encoder = run / "best_encoder.ckpt"
-    load_state(encoder)
-    features = run / "features"
-    required = [features / f"{task}_{split}_{suffix}.txt" for task in FEFF_TASKS for split in SPLITS for suffix in ("X", "y")]
-    missing = [str(path) for path in required if not path.is_file()]
-    if missing: raise FileNotFoundError("Completed run is missing feature artifacts:\n" + "\n".join(missing[:12]))
-    validate_features(features, project_root())
-    universal = run / "heads/universalXAS/best.pt"
-    universal_state = load_state(universal)
-    validation_rows, test_rows = [], []
+def write_evaluations(run: Path, features: Path, args: argparse.Namespace) -> None:
+    universal_head = XASSpectralHead()
+    universal_checkpoint = run / "heads/universalXAS/best.pt"
+    universal_head.load_state_dict(load_state(universal_checkpoint), strict=True)
+    universal_head.eval()
+    universal_validation, universal_test = [], []
+    tuned_validation, tuned_test = [], []
     for task in FEFF_TASKS:
         split = load_feature_split(features, task)
-        val = predict_head(universal_state, split.val.X, split.val.y, split.train.y, args.batch_size)
-        test = predict_head(universal_state, split.test.X, split.test.y, split.train.y, args.batch_size)
-        validation_rows.append({"dataset": task, "variant": "UniversalXAS", **{f"val_{k}": v for k, v in val.items()}})
-        test_rows.append({"dataset": task, "variant": "UniversalXAS", **{f"test_{k}": v for k, v in test.items()}})
-    csv_write(run / "universal_validation.csv", validation_rows)
-    csv_write(run / "universal_test.csv", test_rows)
-    tuned_rows, tuned_test_rows = [], []
-    for task in FEFF_TASKS:
-        split = load_feature_split(features, task)
-        checkpoint = run / f"heads/tunedUniversalXAS/{task}/best.pt"
-        state = load_state(checkpoint)
-        tuned_rows.append({"dataset": task, "checkpoint": str(checkpoint), **predict_head(state, split.val.X, split.val.y, split.train.y, args.batch_size)})
-        tuned_test_rows.append({"dataset": task, "checkpoint": str(checkpoint), **predict_head(state, split.test.X, split.test.y, split.train.y, args.batch_size)})
-    csv_write(run / "tuned_validation.csv", tuned_rows)
-    csv_write(run / "tuned_test.csv", tuned_test_rows)
-    print(f"evaluation complete: {run}")
+        val = evaluate_head(universal_head, split.val.X, split.val.y, split.train.y, args.batch_size)
+        test = evaluate_head(universal_head, split.test.X, split.test.y, split.train.y, args.batch_size)
+        universal_validation.append({"dataset": task, "variant": "UniversalXAS", **{f"val_{k}": v for k, v in val.items()}})
+        universal_test.append({"dataset": task, "variant": "UniversalXAS", **{f"test_{k}": v for k, v in test.items()}})
 
+        checkpoint = run / f"heads/tunedUniversalXAS/{task}/best.pt"
+        tuned_head = XASSpectralHead()
+        tuned_head.load_state_dict(load_state(checkpoint), strict=True)
+        tuned_head.eval()
+        tuned_validation.append({"dataset": task, "checkpoint": str(checkpoint), **evaluate_head(tuned_head, split.val.X, split.val.y, split.train.y, args.batch_size)})
+        tuned_test.append({"dataset": task, "checkpoint": str(checkpoint), **evaluate_head(tuned_head, split.test.X, split.test.y, split.train.y, args.batch_size)})
+    csv_write(run / "universal_validation.csv", universal_validation)
+    csv_write(run / "universal_test.csv", universal_test)
+    csv_write(run / "tuned_validation.csv", tuned_validation)
+    csv_write(run / "tuned_test.csv", tuned_test)
 
 def main() -> None:
     args = parse_args()
+    if args.batch_size < 1:
+        raise ValueError("--batch-size must be at least 1")
     if args.resume and args.overwrite: raise ValueError("Use either --resume or --overwrite, not both")
     if args.evaluate and args.overwrite: raise ValueError("--evaluate cannot be combined with --overwrite")
     if args.evaluate and args.resume: raise ValueError("--evaluate cannot be combined with --resume")
@@ -287,11 +284,26 @@ def main() -> None:
         raise ValueError("--resume and --evaluate require --run-name")
     run = output / (args.run_name or f"m3gnet_xas_seed{args.seed}")
     if args.evaluate:
-        evaluate_run(run, args)
+        if not (run / "RUN_COMPLETE.json").is_file():
+            raise RuntimeError(f"Run is not complete. Missing {run / 'RUN_COMPLETE.json'}")
+        load_state(run / "best_encoder.ckpt")
+        features = run / "features"
+        missing = [
+            str(features / f"{task}_{split}_{suffix}.txt")
+            for task in FEFF_TASKS
+            for split in SPLITS
+            for suffix in ("X", "y")
+            if not (features / f"{task}_{split}_{suffix}.txt").is_file()
+        ]
+        if missing:
+            raise FileNotFoundError("Completed run is missing feature artifacts:\n" + "\n".join(missing[:12]))
+        validate_features(features, root)
+        write_evaluations(run, features, args)
+        print(f"evaluation complete: {run}")
         return
     if args.resume and not run.is_dir():
         raise FileNotFoundError(f"Cannot resume missing run directory: {run}")
-    raw = data_root(root)
+    raw = Path(os.environ.get("OMNIXAS_DATA_ROOT", root.parent / "OmniXAS_data")) / "materialscloud_omnixas_raw" / "extracted"
     patch_matgl_gpu_constants(); preflight(root, raw)
     if args.preflight: return
     if args.overwrite and run.exists(): shutil.rmtree(run)
@@ -336,26 +348,13 @@ def main() -> None:
                 ys.append(b["y"].numpy())
             X, y = np.concatenate(xs), np.concatenate(ys); np.savetxt(features / f"{task}_{split}_X.txt", X); np.savetxt(features / f"{task}_{split}_y.txt", y)
     validate_features(features, root)
-    ux, uy, uvx, uvy = balanced_universal(features, args.seed); universal = train_head(run / "heads/universalXAS", ux, uy, uvx, uvy, None, args); universal_state = load_state(universal)
-    validation_rows, test_rows = [], []
+    ux, uy, uvx, uvy = balanced_universal(features, args.seed)
+    universal = train_head(run / "heads/universalXAS", ux, uy, uvx, uvy, None, args)
+    universal_state = load_state(universal)
     for task in FEFF_TASKS:
         split = load_feature_split(features, task)
-        val = predict_head(universal_state, split.val.X, split.val.y, split.train.y, args.batch_size)
-        test = predict_head(universal_state, split.test.X, split.test.y, split.train.y, args.batch_size)
-        validation_rows.append({"dataset": task, "variant": "UniversalXAS", **{f"val_{k}": v for k, v in val.items()}})
-        test_rows.append({"dataset": task, "variant": "UniversalXAS", **{f"test_{k}": v for k, v in test.items()}})
-    csv_write(run / "universal_validation.csv", validation_rows)
-    csv_write(run / "universal_test.csv", test_rows)
-    tuned_rows, tuned_test_rows = [], []
-    for task in FEFF_TASKS:
-        split = load_feature_split(features, task)
-        ckpt = train_head(run / f"heads/tunedUniversalXAS/{task}", split.train.X, split.train.y, split.val.X, split.val.y, universal_state, args)
-        val = predict_head(load_state(ckpt), split.val.X, split.val.y, split.train.y, args.batch_size)
-        test = predict_head(load_state(ckpt), split.test.X, split.test.y, split.train.y, args.batch_size)
-        tuned_rows.append({"dataset": task, "checkpoint": str(ckpt), **val})
-        tuned_test_rows.append({"dataset": task, "checkpoint": str(ckpt), **test})
-    csv_write(run / "tuned_validation.csv", tuned_rows)
-    csv_write(run / "tuned_test.csv", tuned_test_rows)
+        train_head(run / f"heads/tunedUniversalXAS/{task}", split.train.X, split.train.y, split.val.X, split.val.y, universal_state, args)
+    write_evaluations(run, features, args)
     (run / "RUN_COMPLETE.json").write_text(json.dumps({"status": "complete", "selection": "validation metrics only, test evaluated once", "encoder": str(encoder_path), "universal": str(universal)}, indent=2), encoding="utf-8")
 
 
