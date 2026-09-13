@@ -56,7 +56,7 @@ from omnixas.data.feff_graph import (
     validate_raw_structures,
 )
 
-DEFAULT_EPOCHS = 300
+DEFAULT_EPOCHS = 1000
 
 
 def parse_args() -> argparse.Namespace:
@@ -74,9 +74,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--encoder-epochs", type=int, default=DEFAULT_EPOCHS)
     p.add_argument("--encoder-rows-per-element", type=int, default=12)
     p.add_argument("--encoder-lr", type=float, default=1e-3)
-    p.add_argument("--head-epochs", type=int, default=800)
+    p.add_argument("--head-epochs", type=int, default=800, help="universal head max epochs")
     p.add_argument("--head-patience", type=int, default=60)
-    p.add_argument("--head-lr", type=float, default=7e-4)
+    p.add_argument("--tuned-epochs", type=int, default=1000, help="tuned head max epochs")
     p.add_argument("--batch-size", type=int, default=96)
     return p.parse_args()
 
@@ -161,7 +161,8 @@ class LitScratch(pl.LightningModule):
 
     def configure_optimizers(self):
         opt = torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=1e-5)
-        return {"optimizer": opt, "lr_scheduler": {"scheduler": torch.optim.lr_scheduler.CosineAnnealingLR(opt, self.epochs, eta_min=1e-6), "interval": "epoch"}}
+        sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=16, min_lr=1e-6)
+        return {"optimizer": opt, "lr_scheduler": {"scheduler": sched, "monitor": "val_balanced_rel_mse"}}
 
 
 def baselines(root: Path) -> tuple[torch.Tensor, torch.Tensor]:
@@ -219,7 +220,9 @@ def balanced_universal(features: Path, seed: int) -> tuple[np.ndarray, np.ndarra
     return np.concatenate(train), np.concatenate(y), np.concatenate([s.val.X for s in splits]), np.concatenate([s.val.y for s in splits])
 
 
-def train_head(out: Path, X: np.ndarray, y: np.ndarray, val_X: np.ndarray, val_y: np.ndarray, source: dict | None, args: argparse.Namespace) -> Path:
+def train_head(out: Path, X: np.ndarray, y: np.ndarray, val_X: np.ndarray, val_y: np.ndarray, source: dict | None, args: argparse.Namespace, *, lr: float, epochs: int, schedule: str, es_metric: str) -> Path:
+    # settings ported from the balanced-activation pipeline best run (plain Adam, no weight decay)
+    # patience=16 emulates the old pipeline's plateau (checked every 2 epochs with patience 8): identical LR-reduction timing (no improvement for 16 epochs)
     checkpoint = out / "best.pt"
     if out.exists() and not checkpoint.exists():
         raise RuntimeError(f"Head directory is incomplete and will not be reused: {out}")
@@ -229,20 +232,39 @@ def train_head(out: Path, X: np.ndarray, y: np.ndarray, val_X: np.ndarray, val_y
     head = XASSpectralHead()
     if source is not None: head.load_state_dict(source, strict=True)
     head.to(device)
-    opt = torch.optim.AdamW(head.parameters(), lr=args.head_lr, weight_decay=1e-5); best = float("inf"); stale = 0
+    opt = torch.optim.Adam(head.parameters(), lr=lr); best = float("inf"); stale = 0
+    if schedule == "plateau":
+        sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=16, min_lr=1e-6)
+    elif schedule == "cosine":
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=500, eta_min=1e-6)
+    else:
+        raise ValueError(f"Unknown head schedule: {schedule}")
+    if es_metric not in ("mean", "median"):
+        raise ValueError(f"Unknown es_metric: {es_metric}")
     loader = DataLoader(TensorDataset(torch.tensor(X), torch.tensor(y)), batch_size=args.batch_size, shuffle=True, pin_memory=device.type == "cuda")
     val_X_tensor = torch.tensor(val_X).to(device)
     val_y_tensor = torch.tensor(val_y).to(device)
-    for epoch in range(args.head_epochs):
+    for epoch in range(epochs):
         head.train()
         for xb, yb in loader:
             xb, yb = xb.to(device, non_blocking=device.type == "cuda"), yb.to(device, non_blocking=device.type == "cuda")
             opt.zero_grad(); loss = (head(xb) - yb).square().mean(); loss.backward(); opt.step()
         head.eval()
-        with torch.inference_mode(): val = float((head(val_X_tensor) - val_y_tensor).square().mean())
-        if val < best: best, stale = val, 0; torch.save({"state_dict": head.state_dict(), "epoch": epoch, "val_loss": val}, checkpoint)
-        else: stale += 1
-        if stale >= args.head_patience: break
+        with torch.inference_mode():
+            val_mse = (head(val_X_tensor) - val_y_tensor).square().mean(1)
+            val = float(val_mse.mean())
+            val_metric = float(val_mse.median()) if es_metric == "median" else val
+        if val_metric < best:
+            best, stale = val_metric, 0
+            torch.save({"state_dict": head.state_dict(), "epoch": epoch, "val_loss": val}, checkpoint)
+        else:
+            stale += 1
+        if schedule == "plateau":
+            sched.step(val)
+        else:
+            sched.step()
+        if stale >= args.head_patience:
+            break
     if not checkpoint.is_file(): raise RuntimeError(f"Head training produced no checkpoint: {out}")
     return checkpoint
 
@@ -345,7 +367,7 @@ def main() -> None:
         train_loader = DataLoader(train_ds, batch_sampler=sampler, collate_fn=collate, **graph_loader_kwargs)
         val_loader = DataLoader(FEFFDataset(root, raw, FEFF_TASKS, "val"), batch_size=ENCODER_BATCH, collate_fn=collate, **graph_loader_kwargs)
         cb = ModelCheckpoint(run / "encoder_checkpoints", filename="best-{epoch:03d}-{val_balanced_rel_mse:.5f}", monitor="val_balanced_rel_mse", mode="min", save_top_k=1, save_last=True)
-        trainer = pl.Trainer(max_epochs=args.encoder_epochs, accelerator="auto", devices=1, precision=args.precision, callbacks=[cb, EarlyStopping(monitor="val_balanced_rel_mse", patience=30, mode="min")], logger=CSVLogger(str(run), name="encoder_logs"), log_every_n_steps=1)
+        trainer = pl.Trainer(max_epochs=args.encoder_epochs, accelerator="auto", devices=1, precision=args.precision, callbacks=[cb, EarlyStopping(monitor="val_balanced_rel_mse", patience=60, mode="min")], logger=CSVLogger(str(run), name="encoder_logs"), log_every_n_steps=1)
         trainer.fit(LitScratch(model, train_base, val_base, args.encoder_lr, args.encoder_epochs), train_loader, val_loader, ckpt_path=str(run / "encoder_checkpoints/last.ckpt") if args.resume and (run / "encoder_checkpoints/last.ckpt").exists() else None)
         if not cb.best_model_path: raise RuntimeError("Encoder training produced no validation checkpoint")
         shutil.copy2(cb.best_model_path, encoder_path)
@@ -363,11 +385,11 @@ def main() -> None:
             X, y = np.concatenate(xs), np.concatenate(ys); np.savetxt(features / f"{task}_{split}_X.txt", X); np.savetxt(features / f"{task}_{split}_y.txt", y)
     validate_features(features, root)
     ux, uy, uvx, uvy = balanced_universal(features, args.seed)
-    universal = train_head(run / "heads/universalXAS", ux, uy, uvx, uvy, None, args)
+    universal = train_head(run / "heads/universalXAS", ux, uy, uvx, uvy, None, args, lr=5e-4, epochs=args.head_epochs, schedule="plateau", es_metric="mean")
     universal_state = load_state(universal)
     for task in FEFF_TASKS:
         split = load_feature_split(features, task)
-        train_head(run / f"heads/tunedUniversalXAS/{task}", split.train.X, split.train.y, split.val.X, split.val.y, universal_state, args)
+        train_head(run / f"heads/tunedUniversalXAS/{task}", split.train.X, split.train.y, split.val.X, split.val.y, universal_state, args, lr=3e-4, epochs=args.tuned_epochs, schedule="cosine", es_metric="median")
     write_evaluations(run, features, args)
     (run / "RUN_COMPLETE.json").write_text(json.dumps({"status": "complete", "selection": "validation metrics only, test evaluated once", "encoder": str(encoder_path), "universal": str(universal)}, indent=2), encoding="utf-8")
 
