@@ -220,19 +220,21 @@ def balanced_universal(features: Path, seed: int) -> tuple[np.ndarray, np.ndarra
     return np.concatenate(train), np.concatenate(y), np.concatenate([s.val.X for s in splits]), np.concatenate([s.val.y for s in splits])
 
 
-def train_head(out: Path, X: np.ndarray, y: np.ndarray, val_X: np.ndarray, val_y: np.ndarray, source: dict | None, args: argparse.Namespace, *, lr: float, epochs: int, schedule: str, es_metric: str) -> Path:
+def train_head(out: Path, X: np.ndarray, y: np.ndarray, val_X: np.ndarray, val_y: np.ndarray, source: dict | None, args: argparse.Namespace, *, lr: float, epochs: int, schedule: str, es_metric: str, label: str) -> Path:
     # settings ported from the balanced-activation pipeline best run (plain Adam, no weight decay)
     # patience=16 emulates the old pipeline's plateau (checked every 2 epochs with patience 8): identical LR-reduction timing (no improvement for 16 epochs)
     checkpoint = out / "best.pt"
     if out.exists() and not checkpoint.exists():
         raise RuntimeError(f"Head directory is incomplete and will not be reused: {out}")
     out.mkdir(parents=True, exist_ok=True)
-    if checkpoint.exists(): return checkpoint
+    if checkpoint.exists():
+        print(f"[{label}] reusing existing checkpoint: {checkpoint}", flush=True)
+        return checkpoint
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     head = XASSpectralHead()
     if source is not None: head.load_state_dict(source, strict=True)
     head.to(device)
-    opt = torch.optim.Adam(head.parameters(), lr=lr); best = float("inf"); stale = 0
+    opt = torch.optim.Adam(head.parameters(), lr=lr); best = float("inf"); stale = 0; best_epoch = -1
     if schedule == "plateau":
         sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=16, min_lr=1e-6)
     elif schedule == "cosine":
@@ -244,6 +246,7 @@ def train_head(out: Path, X: np.ndarray, y: np.ndarray, val_X: np.ndarray, val_y
     loader = DataLoader(TensorDataset(torch.tensor(X), torch.tensor(y)), batch_size=args.batch_size, shuffle=True, pin_memory=device.type == "cuda")
     val_X_tensor = torch.tensor(val_X).to(device)
     val_y_tensor = torch.tensor(val_y).to(device)
+    print(f"[{label}] start: epochs={epochs} lr={lr} schedule={schedule} es_metric={es_metric}", flush=True)
     for epoch in range(epochs):
         head.train()
         for xb, yb in loader:
@@ -255,7 +258,7 @@ def train_head(out: Path, X: np.ndarray, y: np.ndarray, val_X: np.ndarray, val_y
             val = float(val_mse.mean())
             val_metric = float(val_mse.median()) if es_metric == "median" else val
         if val_metric < best:
-            best, stale = val_metric, 0
+            best, stale, best_epoch = val_metric, 0, epoch
             torch.save({"state_dict": head.state_dict(), "epoch": epoch, "val_loss": val}, checkpoint)
         else:
             stale += 1
@@ -263,9 +266,12 @@ def train_head(out: Path, X: np.ndarray, y: np.ndarray, val_X: np.ndarray, val_y
             sched.step(val)
         else:
             sched.step()
+        print(f"[{label}] epoch {epoch+1:4d}/{epochs}  val={val_metric:.6e}  best={best:.6e}  lr={opt.param_groups[0]['lr']:.2e}", flush=True)
         if stale >= args.head_patience:
+            print(f"[{label}] early stopping at epoch {epoch+1}/{epochs}, best at epoch {best_epoch}", flush=True)
             break
     if not checkpoint.is_file(): raise RuntimeError(f"Head training produced no checkpoint: {out}")
+    print(f"[{label}] done, checkpoint: {checkpoint}", flush=True)
     return checkpoint
 
 
@@ -376,6 +382,8 @@ def main() -> None:
     if missing and len(missing) != len(expected):
         raise RuntimeError("Feature directory is incomplete. Remove it only with --overwrite, then regenerate all features.")
     model = M3GNetXAS(); state = torch.load(encoder_path, map_location="cpu", weights_only=False)["state_dict"]; model.load_state_dict({k.removeprefix("model."): v for k, v in state.items() if k.startswith("model.")}, strict=True); model.eval(); device = torch.device("cuda" if torch.cuda.is_available() else "cpu"); model.to(device); collate = CollateGraphs(model.encoder)
+    if missing:
+        print(f"Exporting M3GNet features for {len(missing)} split(s)...", flush=True)
     with torch.inference_mode():
         for task, split in missing:
             loader = DataLoader(FEFFDataset(root, raw, [task], split), batch_size=ENCODER_BATCH, collate_fn=collate, **graph_loader_kwargs); xs, ys = [], []
@@ -383,15 +391,20 @@ def main() -> None:
                 xs.append(model.encode(b["graph"].to(device), b["line_graph"].to(device), b["site"].to(device), scaled=True).cpu().numpy())
                 ys.append(b["y"].numpy())
             X, y = np.concatenate(xs), np.concatenate(ys); np.savetxt(features / f"{task}_{split}_X.txt", X); np.savetxt(features / f"{task}_{split}_y.txt", y)
+            print(f"[features] {task}/{split}: {len(X)} rows", flush=True)
     validate_features(features, root)
     ux, uy, uvx, uvy = balanced_universal(features, args.seed)
-    universal = train_head(run / "heads/universalXAS", ux, uy, uvx, uvy, None, args, lr=5e-4, epochs=args.head_epochs, schedule="plateau", es_metric="mean")
+    print(f"Training UniversalXAS head (max {args.head_epochs} epochs)...", flush=True)
+    universal = train_head(run / "heads/universalXAS", ux, uy, uvx, uvy, None, args, lr=5e-4, epochs=args.head_epochs, schedule="plateau", es_metric="mean", label="UniversalXAS")
     universal_state = load_state(universal)
-    for task in FEFF_TASKS:
+    for i, task in enumerate(FEFF_TASKS):
         split = load_feature_split(features, task)
-        train_head(run / f"heads/tunedUniversalXAS/{task}", split.train.X, split.train.y, split.val.X, split.val.y, universal_state, args, lr=3e-4, epochs=args.tuned_epochs, schedule="cosine", es_metric="median")
+        print(f"Training tuned head for {task} ({i + 1}/{len(FEFF_TASKS)}, max {args.tuned_epochs} epochs)...", flush=True)
+        train_head(run / f"heads/tunedUniversalXAS/{task}", split.train.X, split.train.y, split.val.X, split.val.y, universal_state, args, lr=3e-4, epochs=args.tuned_epochs, schedule="cosine", es_metric="median", label=f"Tuned {task}")
+    print("Evaluating heads on val and test splits...", flush=True)
     write_evaluations(run, features, args)
     (run / "RUN_COMPLETE.json").write_text(json.dumps({"status": "complete", "selection": "validation metrics only, test evaluated once", "encoder": str(encoder_path), "universal": str(universal)}, indent=2), encoding="utf-8")
+    print(f"Run complete: {run}", flush=True)
 
 
 if __name__ == "__main__": main()
