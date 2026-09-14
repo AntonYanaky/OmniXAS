@@ -145,6 +145,8 @@ class LitScratch(pl.LightningModule):
         self.register_buffer("train_base", train_base)
         self.register_buffer("val_base", val_base)
         self.val_mse, self.val_task = [], []
+        self.train_graph_cache_hits = 0
+        self.train_graph_cache_builds = 0
 
     def step(self, batch, stage):
         graph = batch["graph"].to(self.device)
@@ -158,14 +160,26 @@ class LitScratch(pl.LightningModule):
         loss = (mse / base[task].clamp_min(1e-12)).mean() + 0.02 * (
             torch.diff(pred, dim=1) - torch.diff(y, dim=1)
         ).square().mean()
-        self.log(f"{stage}_loss", loss, on_epoch=True, prog_bar=True)
+        self.log(f"{stage}_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
         if stage == "val":
             self.val_mse.append(mse.detach())
             self.val_task.append(task.detach())
         return loss
 
+    def on_train_epoch_start(self):
+        self.train_graph_cache_hits = 0
+        self.train_graph_cache_builds = 0
+
     def training_step(self, batch, _):
+        self.train_graph_cache_hits += batch["graph_cache_hits"]
+        self.train_graph_cache_builds += batch["graph_cache_builds"]
         return self.step(batch, "train")
+
+    def on_train_epoch_end(self):
+        total = self.train_graph_cache_hits + self.train_graph_cache_builds
+        hit_rate = self.train_graph_cache_hits / total if total else 0.0
+        self.log("train_graph_cache_hit_rate", hit_rate, on_step=False, on_epoch=True, prog_bar=True)
+        self.log("train_graph_builds", self.train_graph_cache_builds, on_step=False, on_epoch=True)
 
     def on_validation_epoch_start(self):
         self.val_mse, self.val_task = [], []
@@ -464,7 +478,7 @@ def main() -> None:
             flush=True,
         )
         cb = ModelCheckpoint(run / "encoder_checkpoints", filename="best-{epoch:03d}-{val_balanced_rel_mse:.5f}", monitor="val_balanced_rel_mse", mode="min", save_top_k=1, save_last=True)
-        trainer = pl.Trainer(max_epochs=args.encoder_epochs, accelerator="auto", devices=1, precision=args.precision, callbacks=[cb, EarlyStopping(monitor="val_balanced_rel_mse", patience=60, mode="min")], logger=CSVLogger(str(run), name="encoder_logs"), log_every_n_steps=1)
+        trainer = pl.Trainer(max_epochs=args.encoder_epochs, accelerator="auto", devices=1, precision=args.precision, callbacks=[cb, EarlyStopping(monitor="val_balanced_rel_mse", patience=60, mode="min")], logger=CSVLogger(str(run), name="encoder_logs"), log_every_n_steps=10)
         trainer.fit(LitScratch(model, train_base, val_base, args.encoder_lr), train_loader, val_loader, ckpt_path=str(run / "encoder_checkpoints/last.ckpt") if args.resume and (run / "encoder_checkpoints/last.ckpt").exists() else None)
         if not cb.best_model_path: raise RuntimeError("Encoder training produced no validation checkpoint")
         shutil.copy2(cb.best_model_path, encoder_path)

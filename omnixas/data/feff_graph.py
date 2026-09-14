@@ -183,13 +183,16 @@ class CollateGraphs:
 
     def __call__(self, batch):
         graphs, line_graphs, sites, tasks, y = [], [], [], [], []
+        graph_cache_hits = graph_cache_builds = 0
         offset = 0
         for task, mid, structure, site, yi in batch:
             key = (task, mid)
             # Cache graph builds per material for reuse.
             if key in self._graph_cache:
+                graph_cache_hits += 1
                 self._graph_cache.move_to_end(key)
             else:
+                graph_cache_builds += 1
                 self._graph_cache[key] = self._build_graphs(structure)
                 if len(self._graph_cache) > GRAPH_CACHE_MAX:
                     self._graph_cache.popitem(last=False)
@@ -206,6 +209,8 @@ class CollateGraphs:
             "site": torch.tensor(sites),
             "task": torch.tensor(tasks),
             "y": torch.stack(y).float(),
+            "graph_cache_hits": graph_cache_hits,
+            "graph_cache_builds": graph_cache_builds,
         }
 
 
