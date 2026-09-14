@@ -160,7 +160,7 @@ class LitScratch(pl.LightningModule):
         loss = (mse / base[task].clamp_min(1e-12)).mean() + 0.02 * (
             torch.diff(pred, dim=1) - torch.diff(y, dim=1)
         ).square().mean()
-        self.log(f"{stage}_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log(f"{stage}_loss", loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=y.shape[0])
         if stage == "val":
             self.val_mse.append(mse.detach())
             self.val_task.append(task.detach())
