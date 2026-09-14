@@ -32,7 +32,8 @@ import numpy as np
 import torch
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 from lightning.pytorch.loggers import CSVLogger
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 from omnixas.model.m3gnet_xas import (
     FEATURE_DIM,
@@ -73,11 +74,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--precision", choices=("32-true", "bf16-mixed"), default="32-true")
     p.add_argument("--encoder-epochs", type=int, default=DEFAULT_EPOCHS)
     p.add_argument("--encoder-rows-per-element", type=int, default=12)
+    p.add_argument("--encoder-eval-batch-size", type=int, default=ENCODER_BATCH)
     p.add_argument("--encoder-lr", type=float, default=1e-3)
     p.add_argument("--head-epochs", type=int, default=800, help="universal head max epochs")
     p.add_argument("--head-patience", type=int, default=60)
     p.add_argument("--tuned-epochs", type=int, default=1000, help="tuned head max epochs")
     p.add_argument("--batch-size", type=int, default=96)
+    p.add_argument("--prefetch-factor", type=int, default=2)
     return p.parse_args()
 
 
@@ -136,33 +139,65 @@ def preflight(root: Path, raw: Path) -> None:
 
 
 class LitScratch(pl.LightningModule):
-    def __init__(self, model: M3GNetXAS, train_base: torch.Tensor, val_base: torch.Tensor, lr: float, epochs: int):
-        super().__init__(); self.model, self.lr, self.epochs = model, lr, epochs
-        self.register_buffer("train_base", train_base); self.register_buffer("val_base", val_base)
+    def __init__(self, model: M3GNetXAS, train_base: torch.Tensor, val_base: torch.Tensor, lr: float):
+        super().__init__()
+        self.model, self.lr = model, lr
+        self.register_buffer("train_base", train_base)
+        self.register_buffer("val_base", val_base)
         self.val_mse, self.val_task = [], []
 
     def step(self, batch, stage):
-        pred = self.model(batch["graph"].to(self.device), batch["line_graph"].to(self.device), batch["site"].to(self.device)); y = batch["y"].to(self.device); task = batch["task"].to(self.device)
-        mse = ((pred - y) ** 2).mean(1); base = self.train_base if stage == "train" else self.val_base
-        loss = (mse / base[task].clamp_min(1e-12)).mean() + 0.02 * (torch.diff(pred, dim=1) - torch.diff(y, dim=1)).square().mean()
+        graph = batch["graph"].to(self.device)
+        line_graph = batch["line_graph"].to(self.device)
+        site = batch["site"].to(self.device)
+        pred = self.model(graph, line_graph, site)
+        y = batch["y"].to(self.device)
+        task = batch["task"].to(self.device)
+        mse = ((pred - y) ** 2).mean(1)
+        base = self.train_base if stage == "train" else self.val_base
+        loss = (mse / base[task].clamp_min(1e-12)).mean() + 0.02 * (
+            torch.diff(pred, dim=1) - torch.diff(y, dim=1)
+        ).square().mean()
         self.log(f"{stage}_loss", loss, on_epoch=True, prog_bar=True)
-        if stage == "val": self.val_mse.append(mse.detach()); self.val_task.append(task.detach())
+        if stage == "val":
+            self.val_mse.append(mse.detach())
+            self.val_task.append(task.detach())
         return loss
 
-    def training_step(self, batch, _): return self.step(batch, "train")
-    def on_validation_epoch_start(self): self.val_mse, self.val_task = [], []
-    def validation_step(self, batch, _): return self.step(batch, "val")
+    def training_step(self, batch, _):
+        return self.step(batch, "train")
+
+    def on_validation_epoch_start(self):
+        self.val_mse, self.val_task = [], []
+
+    def validation_step(self, batch, _):
+        return self.step(batch, "val")
+
     def on_validation_epoch_end(self):
-        if self.trainer.sanity_checking or not self.val_mse: return
+        if self.trainer.sanity_checking or not self.val_mse:
+            return
         mses, tasks = torch.cat(self.val_mse), torch.cat(self.val_task)
-        rel = [mses[tasks == i].median() / self.val_base[i].clamp_min(1e-12) for i in range(len(FEFF_TASKS)) if (tasks == i).any()]
-        if len(rel) != len(FEFF_TASKS): raise RuntimeError("Validation lacks one or more FEFF elements")
+        rel = [
+            mses[tasks == i].median() / self.val_base[i].clamp_min(1e-12)
+            for i in range(len(FEFF_TASKS))
+            if (tasks == i).any()
+        ]
+        if len(rel) != len(FEFF_TASKS):
+            raise RuntimeError("Validation lacks one or more FEFF elements")
         self.log("val_balanced_rel_mse", torch.stack(rel).mean(), on_epoch=True, prog_bar=True)
 
     def configure_optimizers(self):
-        opt = torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=1e-5)
+        opt = torch.optim.AdamW(
+            self.parameters(),
+            lr=self.lr,
+            weight_decay=1e-5,
+            fused=self.device.type == "cuda",
+        )
         sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=16, min_lr=1e-6)
-        return {"optimizer": opt, "lr_scheduler": {"scheduler": sched, "monitor": "val_balanced_rel_mse"}}
+        return {
+            "optimizer": opt,
+            "lr_scheduler": {"scheduler": sched, "monitor": "val_balanced_rel_mse"},
+        }
 
 
 def baselines(root: Path) -> tuple[torch.Tensor, torch.Tensor]:
@@ -232,9 +267,17 @@ def train_head(out: Path, X: np.ndarray, y: np.ndarray, val_X: np.ndarray, val_y
         return checkpoint
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     head = XASSpectralHead()
-    if source is not None: head.load_state_dict(source, strict=True)
+    if source is not None:
+        head.load_state_dict(source, strict=True)
     head.to(device)
-    opt = torch.optim.Adam(head.parameters(), lr=lr); best = float("inf"); stale = 0; best_epoch = -1
+    opt = torch.optim.Adam(
+        head.parameters(),
+        lr=lr,
+        fused=device.type == "cuda",
+    )
+    best = float("inf")
+    stale = 0
+    best_epoch = -1
     if schedule == "plateau":
         sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=16, min_lr=1e-6)
     elif schedule == "cosine":
@@ -243,15 +286,20 @@ def train_head(out: Path, X: np.ndarray, y: np.ndarray, val_X: np.ndarray, val_y
         raise ValueError(f"Unknown head schedule: {schedule}")
     if es_metric not in ("mean", "median"):
         raise ValueError(f"Unknown es_metric: {es_metric}")
-    loader = DataLoader(TensorDataset(torch.tensor(X), torch.tensor(y)), batch_size=args.batch_size, shuffle=True, pin_memory=device.type == "cuda")
-    val_X_tensor = torch.tensor(val_X).to(device)
-    val_y_tensor = torch.tensor(val_y).to(device)
-    print(f"[{label}] start: epochs={epochs} lr={lr} schedule={schedule} es_metric={es_metric}", flush=True)
-    for epoch in range(epochs):
+    train_X_tensor = torch.as_tensor(X, device=device)
+    train_y_tensor = torch.as_tensor(y, device=device)
+    val_X_tensor = torch.as_tensor(val_X, device=device)
+    val_y_tensor = torch.as_tensor(val_y, device=device)
+    progress = tqdm(range(epochs), desc=label, unit="epoch")
+    stopped_epoch = None
+    for epoch in progress:
         head.train()
-        for xb, yb in loader:
-            xb, yb = xb.to(device, non_blocking=device.type == "cuda"), yb.to(device, non_blocking=device.type == "cuda")
-            opt.zero_grad(); loss = (head(xb) - yb).square().mean(); loss.backward(); opt.step()
+        indices = torch.randperm(len(train_X_tensor), device=device)
+        for index in indices.split(args.batch_size):
+            opt.zero_grad(set_to_none=True)
+            loss = (head(train_X_tensor[index]) - train_y_tensor[index]).square().mean()
+            loss.backward()
+            opt.step()
         head.eval()
         with torch.inference_mode():
             val_mse = (head(val_X_tensor) - val_y_tensor).square().mean(1)
@@ -266,12 +314,19 @@ def train_head(out: Path, X: np.ndarray, y: np.ndarray, val_X: np.ndarray, val_y
             sched.step(val)
         else:
             sched.step()
-        print(f"[{label}] epoch {epoch+1:4d}/{epochs}  val={val_metric:.6e}  best={best:.6e}  lr={opt.param_groups[0]['lr']:.2e}", flush=True)
+        progress.set_postfix(
+            val=f"{val_metric:.2e}",
+            best=f"{best:.2e}",
+            lr=f"{opt.param_groups[0]['lr']:.2e}",
+        )
         if stale >= args.head_patience:
-            print(f"[{label}] early stopping at epoch {epoch+1}/{epochs}, best at epoch {best_epoch}", flush=True)
+            stopped_epoch = epoch + 1
             break
+    progress.close()
+    if stopped_epoch is not None:
+        tqdm.write(f"[{label}] early stopping at epoch {stopped_epoch}/{epochs}, best at epoch {best_epoch}")
     if not checkpoint.is_file(): raise RuntimeError(f"Head training produced no checkpoint: {out}")
-    print(f"[{label}] done, checkpoint: {checkpoint}", flush=True)
+    tqdm.write(f"[{label}] done, checkpoint: {checkpoint}")
     return checkpoint
 
 
@@ -308,11 +363,37 @@ def write_evaluations(run: Path, features: Path, args: argparse.Namespace) -> No
     csv_write(run / "tuned_validation.csv", tuned_validation)
     csv_write(run / "tuned_test.csv", tuned_test)
 
+
+def ensure_file_limit(workers: int) -> None:
+    """Check that the process can open enough file descriptors for DataLoader workers (Linux)."""
+    if workers <= 0 or os.name != "posix":
+        return
+    import resource
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if hard > soft:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+        soft = hard
+    need = 256 + 32 * workers
+    proc_fd = Path("/proc/self/fd")
+    open_fds = len(list(proc_fd.iterdir())) if proc_fd.is_dir() else 0
+    if open_fds + need > soft:
+        raise RuntimeError(
+            f"Not enough open file descriptors for {workers} DataLoader workers: "
+            f"{open_fds} open, limit {soft}, need about {need}. "
+            "Restart the notebook kernel, raise the shell limit (ulimit -n 4096), or lower --num-workers."
+        )
+
+
 def main() -> None:
     torch.set_float32_matmul_precision("high")
     args = parse_args()
     if args.batch_size < 1:
         raise ValueError("--batch-size must be at least 1")
+    if args.encoder_eval_batch_size < 1:
+        raise ValueError("--encoder-eval-batch-size must be at least 1")
+    if args.prefetch_factor < 1:
+        raise ValueError("--prefetch-factor must be at least 1")
+    ensure_file_limit(args.num_workers)
     if args.resume and args.overwrite: raise ValueError("Use either --resume or --overwrite, not both")
     if args.evaluate and args.overwrite: raise ValueError("--evaluate cannot be combined with --overwrite")
     if args.evaluate and args.resume: raise ValueError("--evaluate cannot be combined with --resume")
@@ -363,7 +444,7 @@ def main() -> None:
     train_base, val_base = baselines(root)
     graph_loader_kwargs = {"num_workers": args.num_workers}
     if args.num_workers > 0:
-        graph_loader_kwargs.update(persistent_workers=True, prefetch_factor=1)
+        graph_loader_kwargs.update(persistent_workers=True, prefetch_factor=args.prefetch_factor)
     encoder_path = run / "best_encoder.ckpt"
     if not encoder_path.exists():
         model = M3GNetXAS(); collate = CollateGraphs(model.encoder); train_ds = FEFFDataset(root, raw, FEFF_TASKS, "train")
@@ -371,10 +452,20 @@ def main() -> None:
         rows_per_element = min(args.encoder_rows_per_element, min(task_counts.values()))
         sampler = BalancedTaskBatchSampler(train_ds.rows, rows_per_element, args.seed)
         train_loader = DataLoader(train_ds, batch_sampler=sampler, collate_fn=collate, **graph_loader_kwargs)
-        val_loader = DataLoader(FEFFDataset(root, raw, FEFF_TASKS, "val"), batch_size=ENCODER_BATCH, collate_fn=collate, **graph_loader_kwargs)
+        val_loader = DataLoader(
+            FEFFDataset(root, raw, FEFF_TASKS, "val"),
+            batch_size=args.encoder_eval_batch_size,
+            collate_fn=collate,
+            **graph_loader_kwargs,
+        )
+        print(
+            f"Encoder batch sizes: train={sampler.batch_size} "
+            f"({rows_per_element} rows per element), eval={args.encoder_eval_batch_size}",
+            flush=True,
+        )
         cb = ModelCheckpoint(run / "encoder_checkpoints", filename="best-{epoch:03d}-{val_balanced_rel_mse:.5f}", monitor="val_balanced_rel_mse", mode="min", save_top_k=1, save_last=True)
         trainer = pl.Trainer(max_epochs=args.encoder_epochs, accelerator="auto", devices=1, precision=args.precision, callbacks=[cb, EarlyStopping(monitor="val_balanced_rel_mse", patience=60, mode="min")], logger=CSVLogger(str(run), name="encoder_logs"), log_every_n_steps=1)
-        trainer.fit(LitScratch(model, train_base, val_base, args.encoder_lr, args.encoder_epochs), train_loader, val_loader, ckpt_path=str(run / "encoder_checkpoints/last.ckpt") if args.resume and (run / "encoder_checkpoints/last.ckpt").exists() else None)
+        trainer.fit(LitScratch(model, train_base, val_base, args.encoder_lr), train_loader, val_loader, ckpt_path=str(run / "encoder_checkpoints/last.ckpt") if args.resume and (run / "encoder_checkpoints/last.ckpt").exists() else None)
         if not cb.best_model_path: raise RuntimeError("Encoder training produced no validation checkpoint")
         shutil.copy2(cb.best_model_path, encoder_path)
     features = run / "features"; features.mkdir(exist_ok=True); missing = missing_feature_splits(features, FEFF_TASKS)
@@ -382,25 +473,26 @@ def main() -> None:
     if missing and len(missing) != len(expected):
         raise RuntimeError("Feature directory is incomplete. Remove it only with --overwrite, then regenerate all features.")
     model = M3GNetXAS(); state = torch.load(encoder_path, map_location="cpu", weights_only=False)["state_dict"]; model.load_state_dict({k.removeprefix("model."): v for k, v in state.items() if k.startswith("model.")}, strict=True); model.eval(); device = torch.device("cuda" if torch.cuda.is_available() else "cpu"); model.to(device); collate = CollateGraphs(model.encoder)
-    if missing:
-        print(f"Exporting M3GNet features for {len(missing)} split(s)...", flush=True)
     with torch.inference_mode():
-        for task, split in missing:
-            loader = DataLoader(FEFFDataset(root, raw, [task], split), batch_size=ENCODER_BATCH, collate_fn=collate, **graph_loader_kwargs); xs, ys = [], []
+        for task, split in tqdm(missing, desc="M3GNet feature export", unit="split", disable=not missing):
+            loader = DataLoader(
+                FEFFDataset(root, raw, [task], split),
+                batch_size=args.encoder_eval_batch_size,
+                collate_fn=collate,
+                **graph_loader_kwargs,
+            )
+            xs, ys = [], []
             for b in loader:
                 xs.append(model.encode(b["graph"].to(device), b["line_graph"].to(device), b["site"].to(device), scaled=True).cpu().numpy())
                 ys.append(b["y"].numpy())
             X, y = np.concatenate(xs), np.concatenate(ys); np.savetxt(features / f"{task}_{split}_X.txt", X); np.savetxt(features / f"{task}_{split}_y.txt", y)
-            print(f"[features] {task}/{split}: {len(X)} rows", flush=True)
     validate_features(features, root)
     ux, uy, uvx, uvy = balanced_universal(features, args.seed)
-    print(f"Training UniversalXAS head (max {args.head_epochs} epochs)...", flush=True)
     universal = train_head(run / "heads/universalXAS", ux, uy, uvx, uvy, None, args, lr=5e-4, epochs=args.head_epochs, schedule="plateau", es_metric="mean", label="UniversalXAS")
     universal_state = load_state(universal)
     for i, task in enumerate(FEFF_TASKS):
         split = load_feature_split(features, task)
-        print(f"Training tuned head for {task} ({i + 1}/{len(FEFF_TASKS)}, max {args.tuned_epochs} epochs)...", flush=True)
-        train_head(run / f"heads/tunedUniversalXAS/{task}", split.train.X, split.train.y, split.val.X, split.val.y, universal_state, args, lr=3e-4, epochs=args.tuned_epochs, schedule="cosine", es_metric="median", label=f"Tuned {task}")
+        train_head(run / f"heads/tunedUniversalXAS/{task}", split.train.X, split.train.y, split.val.X, split.val.y, universal_state, args, lr=3e-4, epochs=args.tuned_epochs, schedule="cosine", es_metric="median", label=f"Tuned {task} ({i + 1}/{len(FEFF_TASKS)})")
     print("Evaluating heads on val and test splits...", flush=True)
     write_evaluations(run, features, args)
     (run / "RUN_COMPLETE.json").write_text(json.dumps({"status": "complete", "selection": "validation metrics only, test evaluated once", "encoder": str(encoder_path), "universal": str(universal)}, indent=2), encoding="utf-8")

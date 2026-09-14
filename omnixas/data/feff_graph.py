@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from collections import OrderedDict
 from collections.abc import Iterator
 from pathlib import Path
 import dgl
@@ -28,6 +29,7 @@ from omnixas.data.ml_data import MLData, MLSplits
 FEFF_TASKS = ["Ti_FEFF", "V_FEFF", "Cr_FEFF", "Mn_FEFF", "Fe_FEFF", "Co_FEFF", "Ni_FEFF", "Cu_FEFF"]
 SPLITS = ("train", "val", "test")
 ENCODER_BATCH = 24
+GRAPH_CACHE_MAX = 1024
 
 
 def patch_matgl_gpu_constants() -> None:
@@ -147,7 +149,7 @@ class FEFFDataset(Dataset):
             if not path.is_file():
                 raise FileNotFoundError(f"Missing raw structure for {task} {mid}_{site:03d}: {path}")
             self.cache[key] = Structure.from_file(path) if path.name == "POSCAR" else parse_feff_structure(path)
-        return task, self.cache[key], site, y
+        return task, mid, self.cache[key], site, y
 
 
 class CollateGraphs:
@@ -155,8 +157,9 @@ class CollateGraphs:
         self.converter = Structure2Graph(encoder.element_types, encoder.cutoff)
         self.threebody_cutoff = encoder.threebody_cutoff
         self.task_idx = {task: i for i, task in enumerate(FEFF_TASKS)}
+        self._graph_cache: OrderedDict = OrderedDict()
 
-    def graph(self, structure: Structure):
+    def _build_graphs(self, structure: Structure) -> tuple:
         out = self.converter.get_graph(structure)
         graph = out[0]
         lat = torch.tensor(np.asarray(structure.lattice.matrix, dtype=np.float32))
@@ -174,15 +177,23 @@ class CollateGraphs:
         else:
             graph.ndata["pos"] = torch.tensor(np.asarray(structure.cart_coords, dtype=np.float32))
         graph.edata["bond_vec"], graph.edata["bond_dist"] = compute_pair_vector_and_distance(graph)
-        return graph
+        line_graph = create_line_graph(graph.to("cpu"), self.threebody_cutoff)
+        line_graph.apply_edges(compute_theta_and_phi)
+        return graph, line_graph
 
     def __call__(self, batch):
         graphs, line_graphs, sites, tasks, y = [], [], [], [], []
         offset = 0
-        for task, structure, site, yi in batch:
-            graph = self.graph(structure)
-            line_graph = create_line_graph(graph.to("cpu"), self.threebody_cutoff)
-            line_graph.apply_edges(compute_theta_and_phi)
+        for task, mid, structure, site, yi in batch:
+            key = (task, mid)
+            # Cache graph builds per material for reuse.
+            if key in self._graph_cache:
+                self._graph_cache.move_to_end(key)
+            else:
+                self._graph_cache[key] = self._build_graphs(structure)
+                if len(self._graph_cache) > GRAPH_CACHE_MAX:
+                    self._graph_cache.popitem(last=False)
+            graph, line_graph = self._graph_cache[key]
             graphs.append(graph)
             line_graphs.append(line_graph)
             sites.append(offset + site)
