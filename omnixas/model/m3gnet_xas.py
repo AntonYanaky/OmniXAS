@@ -83,23 +83,25 @@ class M3GNetXASEncoder(nn.Module):
         blocks: int = ENCODER_BLOCKS,
         cutoff: float = ENCODER_CUTOFF,
         threebody_cutoff: float = ENCODER_THREEBODY_CUTOFF,
+        max_n: int = RADIAL_BASIS_MAX_N,
+        max_l: int = RADIAL_BASIS_MAX_L,
     ) -> None:
         super().__init__()
         activation = ActivationFunction["swish"].value()
-        basis_dim = RADIAL_BASIS_MAX_N * RADIAL_BASIS_MAX_L
+        basis_dim = max_n * max_l
 
         self.element_types = DEFAULT_ELEMENTS
         self.cutoff = cutoff
         self.threebody_cutoff = threebody_cutoff
 
         self.bond_expansion = BondExpansion(
-            RADIAL_BASIS_MAX_N,
-            RADIAL_BASIS_MAX_L,
+            max_n,
+            max_l,
             cutoff,
         )
         self.basis_expansion = SphericalBesselWithHarmonics(
-            RADIAL_BASIS_MAX_N,
-            RADIAL_BASIS_MAX_L,
+            max_n,
+            max_l,
             cutoff,
             use_smooth=False,
             use_phi=False,

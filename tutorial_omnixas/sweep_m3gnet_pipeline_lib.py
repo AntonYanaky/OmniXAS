@@ -646,6 +646,10 @@ def train_encoder(
     from omnixas.data import feff_graph as feff
     from omnixas.model.m3gnet_xas import M3GNetXASEncoder
 
+    # defaults match omnixas.model.m3gnet_xas RADIAL_BASIS_MAX_N / RADIAL_BASIS_MAX_L
+    max_n = int(spec.get('max_n', 3))
+    max_l = int(spec.get('max_l', 3))
+
     class LitScratchEncoder(pl.LightningModule):
         """Scratch M3GNet encoder Lightning module mirroring the pipeline
         LitScratch: the encoder is trained jointly with a full 500/500/550
@@ -741,6 +745,8 @@ def train_encoder(
         blocks=spec["blocks"],
         cutoff=spec["cutoff"],
         threebody_cutoff=spec["threebody_cutoff"],
+        max_n=max_n,
+        max_l=max_l,
     )
     train_base, val_base = baselines(root)
     collate = feff.CollateGraphs(encoder)
@@ -805,6 +811,10 @@ def export_features(ckpt_path: Path, run_dir: Path, repo_root: Path, raw_root: P
     from omnixas.data import feff_graph as feff
     from omnixas.model.m3gnet_xas import M3GNetXASEncoder
 
+    # defaults match omnixas.model.m3gnet_xas RADIAL_BASIS_MAX_N / RADIAL_BASIS_MAX_L
+    max_n = int(spec.get('max_n', 3))
+    max_l = int(spec.get('max_l', 3))
+
     ckpt_path = Path(ckpt_path)
     run_dir = Path(run_dir)
     root = Path(repo_root)
@@ -814,12 +824,18 @@ def export_features(ckpt_path: Path, run_dir: Path, repo_root: Path, raw_root: P
     state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     if "state_dict" not in state:
         raise ValueError(f"Encoder checkpoint is missing state_dict: {ckpt_path}")
+    if "spec" not in state:
+        raise ValueError(f"Encoder checkpoint is missing the spec key; cannot verify architecture: {ckpt_path}")
+    if state["spec"] != spec:
+        raise ValueError(f"Encoder spec mismatch between checkpoint and export arguments. Checkpoint spec: {state['spec']}; passed spec: {spec}. Export aborted.")
     encoder = M3GNetXASEncoder(
         dropout=spec["dropout"],
         feature_dim=spec["feature_dim"],
         blocks=spec["blocks"],
         cutoff=spec["cutoff"],
         threebody_cutoff=spec["threebody_cutoff"],
+        max_n=max_n,
+        max_l=max_l,
     )
     encoder.load_state_dict(state["state_dict"], strict=True)
     encoder.eval()
