@@ -411,7 +411,8 @@ def _head_job(job: Job) -> dict:
         opt = _build_optimizer(spec, head.parameters(), device)
         sched = _make_scheduler(spec, opt, epochs)
 
-    best = float("inf")
+    maximize = es_metric == "macro_eta"
+    best = float("-inf") if maximize else float("inf")
     stale = 0
     best_epoch = -1
     stopped_epoch = None
@@ -449,7 +450,7 @@ def _head_job(job: Job) -> dict:
                 loss.backward()
                 opt.step()
             val, sel = evaluate(head)
-            improved = sel > best if es_metric == "macro_eta" else sel < best
+            improved = sel > best if maximize else sel < best
             if improved:
                 best, stale, best_epoch = sel, 0, epoch
                 torch.save({"state_dict": head.state_dict(), "epoch": epoch, "val_loss": val}, checkpoint)
