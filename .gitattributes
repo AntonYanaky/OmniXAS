@@ -1,1 +1,2 @@
 *.ckpt filter=lfs diff=lfs merge=lfs -text
+tutorial_omnixas/anionxas_targets_*.npz filter=lfs diff=lfs merge=lfs -text

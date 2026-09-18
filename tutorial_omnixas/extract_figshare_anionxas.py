@@ -35,7 +35,9 @@ FIGSHARE_ARTICLE_ID = 5678998
 FIGSHARE_FILE_ID = 9932248
 FIGSHARE_ARCHIVE_MD5 = "e866677ebb9270aeb2e15c725bef7e05"
 SOURCE_POINTS = 200
-TARGET_POINTS = 141
+DEFAULT_TARGET_POINTS = 141
+PACKAGE_DEFAULT_TARGET_POINTS = 200
+SUPPORTED_TARGET_POINTS = (141, 200)
 ENERGY_MIN_EV = 0.0
 ENERGY_MAX_EV = 35.0
 SPLIT_NAMES = ("train", "val", "test")
@@ -76,6 +78,8 @@ class ScanResult:
     parse_error_samples: list[str]
     record_error_samples: list[str]
     structure_conflicts: set[tuple[str, str]]
+    raw_spectrum_non_monotonic_candidate_count: int
+    raw_spectrum_non_monotonic_transition_count: int
 
 
 def parse_curated_key(text: str) -> CuratedKey:
@@ -215,8 +219,10 @@ def load_aligned_key_archives(
     return keys, name_by_key
 
 
-def resample_target(values: np.ndarray) -> np.ndarray:
-    """Resample one curated 35 eV target to the 141-point OmniXAS spacing."""
+def resample_target(values: np.ndarray, target_points: int = DEFAULT_TARGET_POINTS) -> np.ndarray:
+    """Validate a clean target and preserve 200 points or resample to 141."""
+    if target_points not in SUPPORTED_TARGET_POINTS:
+        raise ExtractionError(f"target_points must be one of {SUPPORTED_TARGET_POINTS}")
     values = np.asarray(values, dtype=np.float64)
     if values.shape != (SOURCE_POINTS,):
         raise ExtractionError(
@@ -229,7 +235,9 @@ def resample_target(values: np.ndarray) -> np.ndarray:
         raise ExtractionError(f"Curated target contains a negative value: {minimum}")
 
     source_grid = np.linspace(ENERGY_MIN_EV, ENERGY_MAX_EV, SOURCE_POINTS)
-    target_grid = np.linspace(ENERGY_MIN_EV, ENERGY_MAX_EV, TARGET_POINTS)
+    if target_points == SOURCE_POINTS:
+        return values.astype(np.float32)
+    target_grid = np.linspace(ENERGY_MIN_EV, ENERGY_MAX_EV, target_points)
     return np.interp(target_grid, source_grid, values).astype(np.float32)
 
 
@@ -414,9 +422,17 @@ def record_spectrum_table(record: Mapping[str, object]) -> np.ndarray:
         raise ExtractionError(f"Unexpected raw spectrum shape {table.shape}")
     if not np.isfinite(table).all():
         raise ExtractionError("Raw spectrum contains NaN or infinite values")
-    if not np.all(np.diff(table[:, 0]) > 0):
-        raise ExtractionError("Raw spectrum energy values are not strictly increasing")
+    # Figshare contains some valid raw tables whose energy rows are not ordered.
+    # Preserve them exactly; ordering is reported by the caller rather than
+    # treated as a parse failure.  Finite, aligned numeric data is still required.
     return table
+
+
+def raw_spectrum_energy_status(table: np.ndarray) -> tuple[bool, int]:
+    """Return strict-monotonic status and the number of non-increasing steps."""
+    differences = np.diff(np.asarray(table[:, 0], dtype=np.float64))
+    non_monotonic_count = int(np.count_nonzero(differences <= 0))
+    return non_monotonic_count == 0, non_monotonic_count
 
 
 def canonical_structure_digest(structure: Mapping[str, object]) -> str:
@@ -579,10 +595,13 @@ def load_curated_targets(
     keys: Sequence[CuratedKey],
     name_by_key: Mapping[CuratedKey, str],
     spectral_path: Path,
+    target_points: int = DEFAULT_TARGET_POINTS,
 ) -> tuple[list[CuratedKey], np.ndarray, list[dict[str, object]]]:
-    """Load targets, excluding every spectrum with negative intensity."""
+    """Load targets, excluding negative spectra and selecting output points."""
+    if target_points not in SUPPORTED_TARGET_POINTS:
+        raise ExtractionError(f"target_points must be one of {SUPPORTED_TARGET_POINTS}")
     retained_keys: list[CuratedKey] = []
-    targets = np.empty((len(keys), TARGET_POINTS), dtype=np.float32)
+    targets = np.empty((len(keys), target_points), dtype=np.float32)
     retained_count = 0
     excluded: list[dict[str, object]] = []
 
@@ -601,7 +620,7 @@ def load_curated_targets(
                 excluded.append({"key": key.text, "minimum": minimum})
             else:
                 retained_keys.append(key)
-                targets[retained_count] = resample_target(values)
+                targets[retained_count] = resample_target(values, target_points)
                 retained_count += 1
             if (index + 1) % 50_000 == 0:
                 print(f"Validated {index + 1:,}/{len(keys):,} curated targets")
@@ -615,23 +634,24 @@ def write_target_files(
     output_dir: Path,
     keys: Sequence[CuratedKey],
     targets: np.ndarray,
+    target_points: int,
 ) -> None:
-    """Write one two-column, 141-point target file per curated key."""
-    if targets.shape != (len(keys), TARGET_POINTS):
+    """Write one two-column target file per curated key."""
+    if targets.shape != (len(keys), target_points):
         raise ExtractionError(
             f"Target matrix shape {targets.shape} does not match {len(keys)} keys"
         )
-    energy = np.linspace(ENERGY_MIN_EV, ENERGY_MAX_EV, TARGET_POINTS)
+    energy = np.linspace(ENERGY_MIN_EV, ENERGY_MAX_EV, target_points)
     for index, (key, target) in enumerate(zip(keys, targets)):
         directory = site_directory(output_dir, key)
         directory.mkdir(parents=True, exist_ok=True)
         np.savetxt(
-            directory / "spectrum_141.dat",
+            directory / f"spectrum_{target_points}.dat",
             np.column_stack((energy, target)),
             fmt="%.8e",
             header=(
                 "relative_energy_eV curated_anionxas_intensity\n"
-                "141 points; 0.25 eV spacing; intensity scale unchanged"
+                f"{target_points} points; clean AnionXAS energy grid; intensity scale unchanged"
             ),
         )
         if (index + 1) % 10_000 == 0:
@@ -643,6 +663,8 @@ def _write_raw_candidate(
     structure: Mapping[str, object],
     raw_spectrum: np.ndarray,
     key: CuratedKey,
+    raw_spectrum_energy_monotonic: bool,
+    raw_spectrum_energy_non_monotonic_count: int,
 ) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "structure.json").write_text(
@@ -661,6 +683,17 @@ def _write_raw_candidate(
             "Numeric spectrum table as stored in Figshare article 5678998.\n"
             "Column meanings follow the source record. This is not an original xmu.dat."
         ),
+    )
+    (directory / "spectrum_raw_metadata.json").write_text(
+        json.dumps(
+            {
+                "raw_spectrum_energy_monotonic": raw_spectrum_energy_monotonic,
+                "raw_spectrum_energy_non_monotonic_count": raw_spectrum_energy_non_monotonic_count,
+            },
+            indent=2,
+            sort_keys=True,
+        ) + "\n",
+        encoding="utf-8",
     )
 
 
@@ -687,6 +720,8 @@ def scan_figshare_archive(
     record_error_count = 0
     records_read = 0
     matching_candidates = 0
+    raw_spectrum_non_monotonic_candidate_count = 0
+    raw_spectrum_non_monotonic_transition_count = 0
 
     try:
         records: Iterable[tuple[int, dict[str, object]]] = iter_json_lines(archive_path)
@@ -745,12 +780,19 @@ def scan_figshare_archive(
                         f"element(s) {sorted(expected)}"
                     )
                 raw_spectrum = record_spectrum_table(record)
+                raw_spectrum_energy_monotonic, non_monotonic_count = raw_spectrum_energy_status(raw_spectrum)
+                if not raw_spectrum_energy_monotonic:
+                    raw_spectrum_non_monotonic_candidate_count += 1
+                    raw_spectrum_non_monotonic_transition_count += non_monotonic_count
                 candidate_number = int(candidate_counts[index])
                 base_directory = site_directory(output_dir, key)
                 if candidate_number == 1:
                     first_candidate_directory = base_directory / "candidates" / "000"
                     first_candidate_directory.mkdir(parents=True, exist_ok=True)
-                    for name in ("POSCAR", "structure.json", "spectrum_raw.dat"):
+                    for name in (
+                        "POSCAR", "structure.json", "spectrum_raw.dat",
+                        "spectrum_raw_metadata.json",
+                    ):
                         (base_directory / name).replace(first_candidate_directory / name)
                 candidate_directory = (
                     base_directory
@@ -758,7 +800,12 @@ def scan_figshare_archive(
                     else base_directory / "candidates" / f"{candidate_number:03d}"
                 )
                 _write_raw_candidate(
-                    candidate_directory, structure, raw_spectrum, key
+                    candidate_directory,
+                    structure,
+                    raw_spectrum,
+                    key,
+                    raw_spectrum_energy_monotonic,
+                    non_monotonic_count,
                 )
 
                 material_key = (element, material_id)
@@ -805,6 +852,8 @@ def scan_figshare_archive(
         parse_error_samples=parse_error_samples,
         record_error_samples=record_error_samples,
         structure_conflicts=structure_conflicts,
+        raw_spectrum_non_monotonic_candidate_count=raw_spectrum_non_monotonic_candidate_count,
+        raw_spectrum_non_monotonic_transition_count=raw_spectrum_non_monotonic_transition_count,
     )
 
 
@@ -815,8 +864,11 @@ def write_combined_target_archive(
     split_codes: np.ndarray,
 ) -> None:
     """Write compact aligned arrays without object or pickle data."""
+    target_points = int(targets.shape[1])
+    if target_points not in SUPPORTED_TARGET_POINTS:
+        raise ExtractionError(f"unsupported target matrix shape: {targets.shape}")
     energy = np.linspace(
-        ENERGY_MIN_EV, ENERGY_MAX_EV, TARGET_POINTS, dtype=np.float32
+        ENERGY_MIN_EV, ENERGY_MAX_EV, target_points, dtype=np.float32
     )
     temporary_path = path.with_suffix(path.suffix + ".tmp")
     with temporary_path.open("wb") as handle:
@@ -829,6 +881,10 @@ def write_combined_target_archive(
             energies=energy,
             spectras=np.asarray(targets, dtype=np.float32),
             split_codes=np.asarray(split_codes, dtype=np.int8),
+            target_points=np.asarray(target_points, dtype=np.int16),
+            target_provenance=np.asarray(
+                "native clean 200" if target_points == 200 else "resampled 141"
+            ),
         )
     temporary_path.replace(path)
 
@@ -836,7 +892,7 @@ def write_combined_target_archive(
 def load_target_package(
     path: Path,
 ) -> tuple[list[CuratedKey], np.ndarray, np.ndarray]:
-    """Load and validate a portable, already-resampled target package."""
+    """Load and validate a portable 200-point or resampled 141-point package."""
     try:
         with np.load(path, allow_pickle=False) as package:
             required = {"keys", "elements", "material_ids", "sites", "energies", "spectras", "split_codes"}
@@ -850,14 +906,28 @@ def load_target_package(
             energies = np.asarray(package["energies"], dtype=np.float64)
             targets = np.asarray(package["spectras"], dtype=np.float32)
             split_codes = np.asarray(package["split_codes"])
-    except (OSError, ValueError) as exc:
+            declared_points = (
+                int(np.asarray(package["target_points"]).item())
+                if "target_points" in package.files else None
+            )
+            declared_provenance = (
+                str(np.asarray(package["target_provenance"]).item())
+                if "target_provenance" in package.files else None
+            )
+    except (OSError, ValueError, TypeError) as exc:
         raise ExtractionError(f"Could not read target package: {exc}") from exc
     if raw_keys.ndim != 1 or elements.shape != raw_keys.shape or materials.shape != raw_keys.shape or sites.shape != raw_keys.shape:
         raise ExtractionError("Target package identity arrays are not aligned")
-    if targets.shape != (len(raw_keys), TARGET_POINTS):
-        raise ExtractionError(f"Target package spectras has shape {targets.shape}, expected ({len(raw_keys)}, {TARGET_POINTS})")
-    expected_energy = np.linspace(ENERGY_MIN_EV, ENERGY_MAX_EV, TARGET_POINTS)
-    if energies.shape != (TARGET_POINTS,) or not np.allclose(energies, expected_energy):
+    if targets.ndim != 2 or targets.shape[0] != len(raw_keys) or targets.shape[1] not in SUPPORTED_TARGET_POINTS:
+        raise ExtractionError(f"Target package spectras has unsupported shape {targets.shape}")
+    target_points = targets.shape[1]
+    expected_provenance = "native clean 200" if target_points == 200 else "resampled 141"
+    if declared_points is not None and declared_points != target_points:
+        raise ExtractionError("Target package target_points metadata disagrees with spectras")
+    if declared_provenance is not None and declared_provenance != expected_provenance:
+        raise ExtractionError("Target package target_provenance metadata is invalid")
+    expected_energy = np.linspace(ENERGY_MIN_EV, ENERGY_MAX_EV, target_points)
+    if energies.shape != (target_points,) or not np.allclose(energies, expected_energy):
         raise ExtractionError("Target package has an unexpected energy grid")
     if split_codes.shape != (len(raw_keys),) or not np.isin(split_codes, [0, 1, 2]).all():
         raise ExtractionError("Target package has invalid split codes")
@@ -880,13 +950,14 @@ def create_target_package(
     feature_path: Path | None = None,
     *,
     seed: int = 42,
+    target_points: int = PACKAGE_DEFAULT_TARGET_POINTS,
 ) -> dict[str, object]:
-    """Create a small portable package without reading the Figshare archive."""
+    """Create a portable package, preserving native 200 or resampling to 141."""
     if feature_path is not None:
         source_keys, names = load_aligned_key_archives(feature_path, spectral_path)
     else:
         source_keys, names = load_spectral_key_archive(spectral_path)
-    keys, targets, excluded = load_curated_targets(source_keys, names, spectral_path)
+    keys, targets, excluded = load_curated_targets(source_keys, names, spectral_path, target_points)
     split_by_material, row_counts = assign_material_splits(keys, seed)
     split_codes = np.asarray([split_by_material[key.material_id] for key in keys], dtype=np.int8)
     package_path.parent.mkdir(parents=True, exist_ok=True)
@@ -897,7 +968,9 @@ def create_target_package(
         "source_features": None if feature_path is None else str(feature_path.resolve()),
         "source_row_count": len(source_keys), "excluded_negative_target_count": len(excluded),
         "excluded_negative_targets": excluded, "row_count": len(keys),
-        "material_count": len(split_by_material), "target_shape": [len(keys), TARGET_POINTS],
+        "material_count": len(split_by_material), "target_shape": [len(keys), target_points],
+        "target_points": target_points,
+        "target_provenance": "native clean 200" if target_points == 200 else "resampled 141",
         "target_dtype": "float32", "seed": seed,
         "split_row_counts": dict(zip(SPLIT_NAMES, row_counts)),
     }
@@ -1052,6 +1125,7 @@ def extract_dataset(
     allow_incomplete: bool = False,
     max_records: int | None = None,
     key_file: Path | None = None,
+    target_points: int = DEFAULT_TARGET_POINTS,
 ) -> dict[str, object]:
     """Build the curated hierarchy and return its report."""
     if not archive_path.is_file():
@@ -1078,7 +1152,7 @@ def extract_dataset(
             if missing:
                 raise ExtractionError(f"Key file keys missing from spectra NPZ (first): {missing[:3]}")
             keys, targets, excluded_negative_targets = load_curated_targets(
-                source_keys, names_by_key, spectral_path
+                source_keys, names_by_key, spectral_path, target_points
             )
             source_spectral_digest = file_digest(spectral_path, "sha256")
     elif target_package is not None:
@@ -1097,7 +1171,7 @@ def extract_dataset(
         source_keys, name_by_key = load_aligned_key_archives(feature_path, spectral_path)
         print(f"Validating {len(source_keys):,} curated targets")
         keys, targets, excluded_negative_targets = load_curated_targets(
-            source_keys, name_by_key, spectral_path
+            source_keys, name_by_key, spectral_path, target_points
         )
         source_feature_digest = file_digest(feature_path, "sha256")
         source_spectral_digest = file_digest(spectral_path, "sha256")
@@ -1133,11 +1207,12 @@ def extract_dataset(
             [split_by_material[key.material_id] for key in keys], dtype=np.int8
         )
 
+    output_target_points = None if targets is None else int(targets.shape[1])
     if targets is not None:
-        print(f"Writing {len(keys):,} curated 141-point targets")
-        write_target_files(working_dir, keys, targets)
+        print(f"Writing {len(keys):,} curated {output_target_points}-point targets")
+        write_target_files(working_dir, keys, targets, output_target_points)
         write_combined_target_archive(
-            working_dir / "targets_141.npz", keys, targets, split_codes
+            working_dir / f"targets_{output_target_points}.npz", keys, targets, split_codes
         )
 
     candidate_counts = np.zeros(len(keys), dtype=np.uint32)
@@ -1187,14 +1262,16 @@ def extract_dataset(
         "material_count": len(split_by_material),
         "element_count": len(element_counts),
         "element_counts": dict(sorted(element_counts.items())),
-        "target_shape": None if targets is None else [len(keys), TARGET_POINTS],
+        "target_shape": None if targets is None else [len(keys), output_target_points],
+        "target_points": output_target_points,
+        "target_provenance": None if targets is None else ("native clean 200" if output_target_points == 200 else "resampled 141"),
         "target_dtype": None if targets is None else "float32",
         "target_energy_eV": {
             "reference": "relative",
             "start": ENERGY_MIN_EV,
             "end": ENERGY_MAX_EV,
             "spacing": 0.25,
-            "points": TARGET_POINTS,
+            "points": output_target_points,
         },
         "target_intensity": "clean AnionXAS scale, unchanged",
         "split": {
@@ -1211,6 +1288,8 @@ def extract_dataset(
         "structure_conflict_material_count": len(scan.structure_conflicts),
         "parse_error_count": scan.parse_error_count,
         "record_error_count": scan.record_error_count,
+        "raw_spectrum_non_monotonic_candidate_count": scan.raw_spectrum_non_monotonic_candidate_count,
+        "raw_spectrum_non_monotonic_transition_count": scan.raw_spectrum_non_monotonic_transition_count,
         "missing_key_samples": [keys[index].text for index in missing_indices[:100]],
         "ambiguous_key_samples": [
             {
@@ -1272,6 +1351,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-package", type=Path, help="portable target NPZ made by --package-only")
     parser.add_argument("--package-only", action="store_true", help="make a portable target package and do not scan Figshare")
     parser.add_argument("--package-output", type=Path, help="output NPZ path for --package-only")
+    parser.add_argument(
+        "--target-points", type=int, choices=SUPPORTED_TARGET_POINTS, default=None,
+        help="target grid: package-only defaults to native 200; extraction defaults to 141",
+    )
     parser.add_argument("--output", type=Path, help="extraction output directory")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -1312,7 +1395,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             package_output = args.package_output or args.output
             if args.spectra is None or package_output is None:
                 raise ExtractionError("--package-only requires --spectra and --package-output (or --output)")
-            report = create_target_package(args.spectra, package_output, args.feature_keys, seed=args.seed)
+            report = create_target_package(
+                args.spectra, package_output, args.feature_keys, seed=args.seed,
+                target_points=args.target_points or PACKAGE_DEFAULT_TARGET_POINTS,
+            )
             print(f"Portable target package written: {package_output}")
             print(f"Report: {package_output.with_suffix('.json')}")
             return 0
@@ -1334,6 +1420,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             allow_incomplete=args.allow_incomplete,
             max_records=args.max_records,
             key_file=args.key_file,
+            target_points=args.target_points or DEFAULT_TARGET_POINTS,
         )
     except ExtractionError as exc:
         print(f"error: {exc}", file=sys.stderr)
