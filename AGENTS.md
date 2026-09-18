@@ -139,3 +139,33 @@ Treat `.ipynb_checkpoints/` as stale editor state, not maintained source.
 5. For non-trivial data or metric logic, add a focused runnable test.
 6. Do not commit generated checkpoints, raw data, Lightning logs, notebook progress output, API keys, or temporary experiment files.
 7. State clearly when a result is exploratory rather than directly comparable to the paper.
+
+## Figshare AnionXAS eight-element workflow
+
+The confirmed Figshare AnionXAS workflow uses the committed target package
+`tutorial_omnixas/anionxas_targets_200.npz` and eight FEFF elements: Ti, V, Cr,
+Mn, Fe, Co, Ni, and Cu. The package contains aligned `keys`, `elements`,
+`material_ids`, `sites`, `spectras`, `energies`, and global material-level
+`split_codes` (0/1/2 = train/validation/test). The default extraction location
+is `$OMNIXAS_DATA_ROOT/anionxas_curated_200/extracted/FEFF`; the extractor writes
+`extracted/FEFF/<element>/<material>/FEFF-XANES/<site>_<element>/` plus manifests
+and reports. The end-to-end entry point is
+`tutorial_omnixas/train_anionxas_e2e_8elem.py`.
+
+Native clean AnionXAS targets have 200 energy points and should be paired with a
+200-output model. The existing 141-point package is a linearly resampled
+comparison, not the native target, and must not be mixed with a 200-output run.
+Raw spectrum energy rows can be non-monotonic; the extraction report records
+this and the package's validated target grid, rather than raw row ordering, is
+used for training. The Figshare archive and large extracted data are managed
+with Git LFS or kept outside Git; do not commit archives, generated checkpoints,
+Lightning logs, or raw data.
+
+Structure records can be ambiguous. Training checks a site-level `POSCAR` first
+and falls back to `candidates/000/POSCAR`, records this policy in provenance, and
+reports/skips rows with no structure. Preserve package row alignment and use its
+`split_codes`; never make site-level random splits. Select encoder/head
+checkpoints using validation metrics only, then evaluate test once. Full runs
+can be expensive and require the pinned PyTorch/MatGL/DGL stack; run
+`--preflight` before training and do not substitute a different encoder or target
+scale silently.
