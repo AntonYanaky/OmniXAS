@@ -28,7 +28,8 @@ def parse_args():
     p.add_argument("--num-workers", type=int, default=0); p.add_argument("--epochs", type=int, default=1000)
     p.add_argument("--encoder-epochs", type=int, default=None); p.add_argument("--head-epochs", type=int, default=800)
     p.add_argument("--tuned-epochs", type=int, default=1000); p.add_argument("--batch-size", type=int, default=96)
-    p.add_argument("--encoder-batch-size", type=int, default=24); p.add_argument("--head-patience", type=int, default=60)
+    p.add_argument("--encoder-batch-size", type=int, default=24); p.add_argument("--encoder-rows-per-element", type=int, default=12)
+    p.add_argument("--head-patience", type=int, default=60)
     p.add_argument("--preflight", action="store_true"); p.add_argument("--evaluate", action="store_true")
     p.add_argument("--resume", action="store_true"); p.add_argument("--overwrite", action="store_true")
     return p.parse_args()
@@ -159,6 +160,53 @@ class GraphRows:
         return f"{e}_FEFF", m, Structure.from_file(path), site, torch.tensor(y)
 
 
+class BalancedGraphRowsBatchSampler:
+    """Yield element-balanced batches and redraw each element's pool per epoch."""
+    def __init__(self, rows, rows_per_element, seed):
+        if rows_per_element < 1:
+            raise ValueError("rows_per_element must be positive")
+        self.indices_by_element = {element: [] for element in ELEMENTS}
+        for index, row in enumerate(rows):
+            element = row[0]
+            if element not in self.indices_by_element:
+                raise ValueError(f"Unexpected element in graph dataset: {element}")
+            self.indices_by_element[element].append(index)
+        counts = [len(self.indices_by_element[element]) for element in ELEMENTS]
+        if any(count < rows_per_element for count in counts):
+            raise ValueError(
+                f"Each element needs at least {rows_per_element} rows: "
+                f"{dict(zip(ELEMENTS, counts))}"
+            )
+        self.rows_per_element = int(rows_per_element)
+        self.batch_size = len(ELEMENTS) * self.rows_per_element
+        self.seed = int(seed)
+        self.epoch = 0
+        self.batches_per_epoch = min(counts) // self.rows_per_element
+        if self.batches_per_epoch < 1:
+            raise ValueError("Balanced sampler has no batches")
+
+    def __len__(self):
+        return self.batches_per_epoch
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed + self.epoch)
+        self.epoch += 1
+        selected = {
+            element: rng.permutation(self.indices_by_element[element])[
+                : self.batches_per_epoch * self.rows_per_element
+            ]
+            for element in ELEMENTS
+        }
+        for batch_number in range(self.batches_per_epoch):
+            start = batch_number * self.rows_per_element
+            stop = (batch_number + 1) * self.rows_per_element
+            batch = np.concatenate([
+                selected[element][start:stop] for element in ELEMENTS
+            ])
+            rng.shuffle(batch)
+            yield batch.tolist()
+
+
 def _train(args, run, rows):
     # Heavy dependencies are deliberately imported here, keeping --preflight/import safe.
     os.environ.setdefault("DGLBACKEND", "pytorch")
@@ -178,7 +226,34 @@ def _train(args, run, rows):
         def encode(self,g,l,s): return self.encoder(g,l,s)*self.feature_scale
         def forward(self,g,l,s): return self.head(self.encode(g,l,s))
     encoder = E2E(); collate = CollateGraphs(encoder.encoder)
-    loaders = {s: DataLoader(GraphRows(rows, s), batch_size=args.encoder_batch_size if s != "train" else args.batch_size, shuffle=s=="train", num_workers=args.num_workers, collate_fn=collate) for s in SPLITS}
+    train_rows = GraphRows(rows, "train")
+    balanced_sampler = BalancedGraphRowsBatchSampler(
+        train_rows.rows, args.encoder_rows_per_element, args.seed
+    )
+    loaders = {
+        "train": DataLoader(
+            train_rows,
+            batch_sampler=balanced_sampler,
+            num_workers=args.num_workers,
+            collate_fn=collate,
+        ),
+        **{
+            s: DataLoader(
+                GraphRows(rows, s),
+                batch_size=args.encoder_batch_size,
+                shuffle=False,
+                num_workers=args.num_workers,
+                collate_fn=collate,
+            )
+            for s in ("val", "test")
+        },
+    }
+    print(
+        f"Encoder batch sizes: train={balanced_sampler.batch_size} "
+        f"({balanced_sampler.rows_per_element} rows per element), "
+        f"eval={args.encoder_batch_size}",
+        flush=True,
+    )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu"); encoder.to(device)
     opt = torch.optim.AdamW(encoder.parameters(), lr=1e-3); best=float("inf"); best_path=run/"best_encoder.pt"
     epochs = args.encoder_epochs or args.epochs
