@@ -165,8 +165,9 @@ def _train(args, run, rows):
     import torch
     import lightning.pytorch as pl
     from torch.utils.data import DataLoader, Dataset
-    from omnixas.data.feff_graph import CollateGraphs
+    from omnixas.data.feff_graph import CollateGraphs, patch_matgl_gpu_constants
     from omnixas.model.m3gnet_xas import M3GNetXASEncoder, XASSpectralHead, FEATURE_SCALE, HEAD_HIDDEN_DIMS
+    patch_matgl_gpu_constants()
     random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed); pl.seed_everything(args.seed, workers=True)
 
     # A 200-output head is used for the end-to-end encoder (not the published 141 head).
