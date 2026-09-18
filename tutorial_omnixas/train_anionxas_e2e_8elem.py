@@ -165,6 +165,7 @@ def _train(args, run, rows):
     import torch
     import lightning.pytorch as pl
     from torch.utils.data import DataLoader, Dataset
+    from tqdm.auto import tqdm
     from omnixas.data.feff_graph import CollateGraphs, patch_matgl_gpu_constants
     from omnixas.model.m3gnet_xas import M3GNetXASEncoder, XASSpectralHead, FEATURE_SCALE, HEAD_HIDDEN_DIMS
     patch_matgl_gpu_constants()
@@ -181,7 +182,8 @@ def _train(args, run, rows):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu"); encoder.to(device)
     opt = torch.optim.AdamW(encoder.parameters(), lr=1e-3); best=float("inf"); best_path=run/"best_encoder.pt"
     epochs = args.encoder_epochs or args.epochs
-    for epoch in range(epochs):
+    progress = tqdm(range(epochs), desc="Encoder", unit="epoch")
+    for epoch in progress:
         encoder.train()
         for b in loaders["train"]:
             opt.zero_grad(); pred=encoder(b["graph"].to(device),b["line_graph"].to(device),b["site"].to(device)); loss=(pred-b["y"].to(device)).square().mean(); loss.backward(); opt.step()
@@ -190,11 +192,13 @@ def _train(args, run, rows):
             for b in loaders["val"]: vals.append((encoder(b["graph"].to(device),b["line_graph"].to(device),b["site"].to(device))-b["y"].to(device)).square().mean().item())
         val=float(np.mean(vals)) if vals else float("inf")
         if val < best: best=val; torch.save({"state_dict":encoder.state_dict(),"epoch":epoch,"val_loss":val},best_path)
-        if epoch % 10 == 0: print(f"encoder epoch {epoch}: val_mse={val:.5g}", flush=True)
+        progress.set_postfix(val_mse=f"{val:.2e}", best=f"{best:.2e}", lr=f"{opt.param_groups[0]['lr']:.2e}")
+        if epoch % 10 == 0: tqdm.write(f"encoder epoch {epoch}: val_mse={val:.5g}", flush=True)
+    progress.close()
     encoder.load_state_dict(torch.load(best_path,map_location=device,weights_only=False)["state_dict"]); encoder.eval()
     features={s: [] for s in SPLITS}; targets={s: [] for s in SPLITS}; elems={s: [] for s in SPLITS}
     with torch.inference_mode():
-        for s in SPLITS:
+        for s in tqdm(SPLITS, desc="Feature export", unit="split"):
             for b in DataLoader(GraphRows(rows, s), batch_size=args.encoder_batch_size, shuffle=False, num_workers=args.num_workers, collate_fn=collate):
                 features[s].append(encoder.encode(b["graph"].to(device),b["line_graph"].to(device),b["site"].to(device)).cpu().numpy()); targets[s].append(b["y"].numpy())
     fdir=run/"features"; fdir.mkdir(exist_ok=True)
@@ -206,7 +210,8 @@ def _train(args, run, rows):
         head=XASSpectralHead(output_dim=TARGET_DIM).to(device)
         if source: head.load_state_dict(source)
         o=torch.optim.Adam(head.parameters(),lr=5e-4); bestv=float("inf"); path=run/"heads"/name/"best.pt"; path.parent.mkdir(parents=True,exist_ok=True)
-        for ep in range(epochs):
+        progress = tqdm(range(epochs), desc=name, unit="epoch")
+        for ep in progress:
             head.train()
             for ix in torch.randperm(len(X)) .split(args.batch_size):
                 o.zero_grad(); z=head(torch.as_tensor(X[ix],device=device)); (z-torch.as_tensor(y[ix],device=device)).square().mean().backward(); o.step()
@@ -214,6 +219,9 @@ def _train(args, run, rows):
             with torch.inference_mode():
                 v=(head(torch.as_tensor(V,device=device))-torch.as_tensor(Y,device=device)).square().mean().item()
             if v<bestv: bestv=v; torch.save({"state_dict":head.state_dict(),"val_mse":v,"epoch":ep},path)
+            progress.set_postfix(val=f"{v:.2e}", best=f"{bestv:.2e}", lr=f"{o.param_groups[0]['lr']:.2e}")
+        progress.close()
+        tqdm.write(f"[{name}] done, checkpoint: {path}")
         return path
     allX,ally=np.concatenate([features[s] for s in ("train",)]),targets["train"]
     universal=fit_head("universalXAS",allX,ally,np.concatenate([features["val"]]),np.concatenate([targets["val"]]))
