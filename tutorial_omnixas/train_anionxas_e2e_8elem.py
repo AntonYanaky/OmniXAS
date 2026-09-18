@@ -268,7 +268,6 @@ def _train(args, run, rows):
         val=float(np.mean(vals)) if vals else float("inf")
         if val < best: best=val; torch.save({"state_dict":encoder.state_dict(),"epoch":epoch,"val_loss":val},best_path)
         progress.set_postfix(val_mse=f"{val:.2e}", best=f"{best:.2e}", lr=f"{opt.param_groups[0]['lr']:.2e}")
-        if epoch % 10 == 0: tqdm.write(f"encoder epoch {epoch}: val_mse={val:.5g}", flush=True)
     progress.close()
     encoder.load_state_dict(torch.load(best_path,map_location=device,weights_only=False)["state_dict"]); encoder.eval()
     features={s: [] for s in SPLITS}; targets={s: [] for s in SPLITS}; elems={s: [] for s in SPLITS}
