@@ -96,6 +96,7 @@ PACKAGE_FORMAT_VERSION = 2
 PACKAGE_COMPLETE = "PACKAGE_COMPLETE.json"
 OUTLIER_SIGMA = 2.5
 MIN_TARGET = -1e-3
+AMPLITUDE_FLOOR = 0.5  # author's filter: keep only spectra with max(mu) > 0.5 (Analyze Spectra.ipynb cell 94)
 DUPLICATE_TOL = 1e-3
 SYMMETRY_TOL = 0.05
 SYMMETRY_SYMPREC = 1e-2
@@ -454,8 +455,9 @@ def pointwise_outlier_filter(
     retained: dict[CuratedKey, Candidate],
     sigma: float,
     min_target: float,
+    amplitude_floor: float = AMPLITUDE_FLOOR,
 ) -> tuple[dict[CuratedKey, Candidate], dict[str, dict], list[dict]]:
-    """Apply the paper's pointwise sigma rule and the negative-target rule."""
+    """Apply the amplitude floor, the pointwise sigma rule, and the negative-target rule."""
     by_element: dict[str, list[CuratedKey]] = {}
     for key in retained:
         by_element.setdefault(key.element, []).append(key)
@@ -465,12 +467,40 @@ def pointwise_outlier_filter(
     rejected_keys: set[CuratedKey] = set()
     for element in sorted(by_element):
         keys = by_element[element]
-        stack = np.stack([retained[key].spectrum for key in keys])
+        # Amplitude floor first: drops degenerate low-amplitude spectra so the
+        # sigma statistics below are computed on real spectra only.
+        survivors = []
+        amplitude_count = 0
+        for key in keys:
+            if np.max(retained[key].spectrum) < amplitude_floor:
+                rejections.append(
+                    {
+                        "element": element,
+                        "material_id": key.material_id,
+                        "site": key.site,
+                        "reason": "low_amplitude",
+                        "detail": f"max {np.max(retained[key].spectrum):.4g} < {amplitude_floor}",
+                    }
+                )
+                rejected_keys.add(key)
+                amplitude_count += 1
+            else:
+                survivors.append(key)
+        if not survivors:
+            stats[element] = {
+                "before_filter": len(keys),
+                "removed_low_amplitude": amplitude_count,
+                "removed_pointwise_outlier": 0,
+                "removed_negative_target": 0,
+                "kept": 0,
+            }
+            continue
+        stack = np.stack([retained[key].spectrum for key in survivors])
         mean = stack.mean(axis=0)
         std = stack.std(axis=0)
         outlier_count = 0
         negative_count = 0
-        for key in keys:
+        for key in survivors:
             spectrum = retained[key].spectrum
             safe_std = std > 0
             if np.any(safe_std & (np.abs(spectrum - mean) > sigma * std)):
@@ -501,9 +531,10 @@ def pointwise_outlier_filter(
                 negative_count += 1
         stats[element] = {
             "before_filter": len(keys),
+            "removed_low_amplitude": amplitude_count,
             "removed_pointwise_outlier": outlier_count,
             "removed_negative_target": negative_count,
-            "kept": len(keys) - outlier_count - negative_count,
+            "kept": len(survivors) - outlier_count - negative_count,
         }
     return {key: retained[key] for key in retained if key not in rejected_keys}, stats, rejections
 
