@@ -1,4 +1,5 @@
 /scripts/
+tests/
 logs
 results
 lightning_logs
@@ -248,3 +249,8 @@ pyrightconfig.json
 tutorial_omnixas/ml_data_m3gnet_depth_cu_feff/
 # Local scratch files
 tmp/
+photos/
+
+# Generated outputs from the retired Figshare/Materials Cloud investigation.
+tutorial_omnixas/analysis_outputs/
+
