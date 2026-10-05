@@ -204,7 +204,9 @@ class FEFFDataset(Dataset):
 
     def __getitem__(self, idx):
         task, mid, site, y = self.rows[idx]
-        key = (task, mid)
+        # Figshare may store a distinct source structure for each absorbing site
+        # of a material, so material-only caching can return the wrong atom list.
+        key = (task, mid, site)
         if key not in self.cache:
             path = structure_path(self.raw_root, task, mid, site)
             if not path.is_file():
@@ -313,8 +315,8 @@ class CollateGraphs:
                     )
                 graph, line_graph = item
             else:
-                key = (task, mid)
-                # Cache graph builds per material for reuse.
+                key = (task, mid, site)
+                # Figshare records for one material can carry site-specific structures.
                 if key in self._graph_cache:
                     self._graph_cache.move_to_end(key)
                 else:
