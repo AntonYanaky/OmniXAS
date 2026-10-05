@@ -5,13 +5,11 @@ Run from the repository root with:
 
     python3 tutorial_omnixas/export_figshare_141_splits.py
 
-The script reads the original Materials Cloud train/val/test ID files in the
-repository and the extracted Figshare tree in ../OmniXAS_data/figshare. It
-reuses globally consistent old material-level split membership and the
-train-only, per-element amplitude calibrations recorded in this script. A
-Figshare material assigned to multiple old partitions is omitted. Figshare-only
-materials go to train. Results go to
-../OmniXAS_data/figshare_141_splits.
+The script reads the extracted Figshare tree in ../OmniXAS_data/figshare and
+creates a deterministic fresh material-level split. It targets 80% train, 10%
+validation, and 10% test site rows per element. Every valid material is assigned
+once, including materials that had conflicting memberships in the old splits.
+Results go to ../OmniXAS_data/figshare_141_splits.
 
 Sampling matches the legacy window and grid: keep positive stored mu values,
 use the element's configured start through start + 35 eV, then linearly sample
@@ -51,6 +49,8 @@ WINDOW_EV = 35.0
 STEP_EV = 0.25
 POINT_COUNT = 141
 PARTITIONS = ("train", "val", "test")
+SPLIT_SEED = 42
+SPLIT_FRACTIONS = {"train": 0.80, "val": 0.10, "test": 0.10}
 TARGET_SCALE_CALIBRATION = {
     "Ti": {"median": 1.662669930, "train_reference_site_count": 658, "coefficient_of_variation": 0.00817, "p05": 1.643154, "p95": 1.693106},
     "V": {"median": 1.505275248, "train_reference_site_count": 473, "coefficient_of_variation": 0.01506, "p05": 1.487556, "p95": 1.553092},
@@ -107,6 +107,62 @@ def read_material_splits(
                 global_memberships.setdefault(material_id, set()).add(partition)
         result[element] = material_split
     return result, global_memberships
+
+
+def assign_material_splits(
+    rows_by_material: dict[str, list[tuple[str, int, np.ndarray]]],
+    seed: int = SPLIT_SEED,
+) -> tuple[dict[str, str], dict[str, dict[str, int]]]:
+    """Assign every material once while matching per-element site-row targets."""
+    totals = {
+        element: sum(
+            1 for rows in rows_by_material.values() for row_element, _, _ in rows
+            if row_element == element
+        )
+        for element in ELEMENT_START_EV
+    }
+    targets = {
+        element: {
+            partition: totals[element] * SPLIT_FRACTIONS[partition]
+            for partition in PARTITIONS
+        }
+        for element in ELEMENT_START_EV
+    }
+    counts = {
+        element: {partition: 0 for partition in PARTITIONS}
+        for element in ELEMENT_START_EV
+    }
+    rng = np.random.default_rng(seed)
+    materials = list(rows_by_material)
+    rng.shuffle(materials)
+    materials.sort(key=lambda material: -len(rows_by_material[material]))
+    assignments: dict[str, str] = {}
+
+    for material in materials:
+        deltas = {
+            element: sum(1 for row_element, _, _ in rows_by_material[material] if row_element == element)
+            for element in ELEMENT_START_EV
+        }
+        scores = []
+        for partition in PARTITIONS:
+            score = 0.0
+            for element in ELEMENT_START_EV:
+                for candidate_partition in PARTITIONS:
+                    candidate = counts[element][candidate_partition]
+                    if candidate_partition == partition:
+                        candidate += deltas[element]
+                    target = targets[element][candidate_partition]
+                    if target:
+                        score += ((candidate - target) / target) ** 2
+            scores.append(score)
+        best = min(scores)
+        choices = [partition for partition, score in zip(PARTITIONS, scores) if np.isclose(score, best)]
+        partition = choices[int(rng.integers(len(choices)))]
+        assignments[material] = partition
+        for element, delta in deltas.items():
+            counts[element][partition] += delta
+
+    return assignments, counts
 
 
 def sample_spectrum(path: Path, element: str, scale: float) -> np.ndarray:
@@ -177,11 +233,6 @@ def main() -> int:
             for material_id, partitions in global_memberships.items()
             if len(partitions) != 1
         }
-        split_by_material = {
-            material_id: next(iter(partitions))
-            for material_id, partitions in global_memberships.items()
-            if len(partitions) == 1
-        }
         element_scales = TARGET_SCALE_CALIBRATION
         output_root.mkdir(parents=True, exist_ok=True)
         ml_dir = output_root / "ml_data"
@@ -196,10 +247,9 @@ def main() -> int:
         }
         ids: dict[tuple[str, str], list[str]] = {key: [] for key in values}
         row_metadata: dict[tuple[str, str], list[dict[str, str]]] = {key: [] for key in values}
+        valid_records: dict[str, list[tuple[str, int, np.ndarray]]] = {}
         omissions: list[dict[str, str]] = []
         source_counts: dict[str, int] = {}
-        figshare_only_material_site_count = 0
-        conflicting_material_site_count = 0
         with manifest_path.open(newline="", encoding="utf-8-sig") as handle:
             reader = csv.DictReader(handle)
             required = {"element", "material_id", "site", "status", "site_directory", "raw_candidate_count"}
@@ -214,16 +264,6 @@ def main() -> int:
                 material_id = row["material_id"]
                 site = int(row["site"])
                 key = (element, material_id, site)
-                if material_id in globally_conflicted_materials:
-                    conflict_partitions = ",".join(
-                        sorted(globally_conflicted_materials[material_id])
-                    )
-                    omissions.append({
-                        "key": repr(key),
-                        "reason": f"existing_material_has_conflicting_splits:{conflict_partitions}",
-                    })
-                    conflicting_material_site_count += 1
-                    continue
                 if status != "matched" or int(row["raw_candidate_count"]) != 1:
                     omissions.append({"key": repr(key), "reason": f"source_status_{status}"})
                     continue
@@ -238,19 +278,28 @@ def main() -> int:
                 except ExportError as exc:
                     omissions.append({"key": repr(key), "reason": str(exc)})
                     continue
-                partition = split_by_material.get(material_id, "train")
-                if material_id not in split_by_material:
-                    figshare_only_material_site_count += 1
+                valid_records.setdefault(material_id, []).append((element, site, y))
+
+        split_by_material, assigned_counts = assign_material_splits(valid_records)
+        conflicting_material_site_count = sum(
+            len(valid_records[material_id])
+            for material_id in globally_conflicted_materials
+            if material_id in valid_records
+        )
+        figshare_only_material_site_count = sum(
+            len(rows)
+            for material_id, rows in valid_records.items()
+            if material_id not in global_memberships
+        )
+        for material_id, rows in valid_records.items():
+            partition = split_by_material[material_id]
+            for element, site, y in rows:
                 split_key = (element, partition)
                 ids[split_key].append(f"{material_id}_{site:03d}")
                 values[split_key].append(y)
                 row_metadata[split_key].append({
-                    "split_source": (
-                        "materialscloud_material_membership"
-                            if material_id in split_by_material
-                        else "figshare_only_assigned_train"
-                    ),
-                    "target_scale_factor": f"{scale:.12g}",
+                    "split_source": "fresh_material_split",
+                    "target_scale_factor": f"{element_scales[element]['median']:.12g}",
                 })
 
         output_counts: dict[str, dict[str, int]] = {}
@@ -279,32 +328,25 @@ def main() -> int:
                         **sorted_metadata[index],
                     })
 
-        # Verify the combined old + Figshare material assignments have no
-        # cross-partition overlaps. Conflicting old IDs were omitted above.
+        # Verify that every fresh material assignment is globally disjoint.
         figshare_materials_by_partition = {
             partition: {
-                site_id.rsplit("_", 1)[0]
-                for (element, row_partition), site_ids in ids.items()
+                material_id
+                for material_id, row_partition in split_by_material.items()
                 if row_partition == partition
-                for site_id in site_ids
             }
             for partition in PARTITIONS
         }
+        assigned_materials = set().union(*figshare_materials_by_partition.values())
+        if assigned_materials != set(valid_records):
+            raise ExportError("Fresh split assignment did not cover every valid material")
         for index, first in enumerate(PARTITIONS):
             for second in PARTITIONS[index + 1 :]:
                 overlap = figshare_materials_by_partition[first] & figshare_materials_by_partition[second]
                 if overlap:
                     raise ExportError(
-                        f"Figshare materials leak between {first} and {second}: "
+                        f"Fresh material split has an overlap between {first} and {second}: "
                         f"{sorted(overlap)[:5]}"
-                    )
-        for partition, materials in figshare_materials_by_partition.items():
-            for material_id in materials:
-                old_parts = global_memberships.get(material_id, set())
-                if old_parts and old_parts != {partition}:
-                    raise ExportError(
-                        f"Figshare {partition} material {material_id} conflicts with "
-                        f"existing split membership {sorted(old_parts)}"
                     )
 
         with (output_root / "manifest.csv").open("w", newline="", encoding="utf-8") as handle:
@@ -334,16 +376,16 @@ def main() -> int:
                 "element_start_ev": ELEMENT_START_EV,
                 "endpoint_policy": "numpy.interp endpoint carry-forward; constant nearest measured value if no source points fall inside the window",
             },
-            "split_policy": "Only Ti, V, Cr, Mn, Fe, Co, Ni, and Cu are exported. Reuse a globally unique Materials Cloud material split across all eight elements; omit Figshare materials assigned to multiple old partitions; assign materials absent from old splits to train. Verify material disjointness across train/val/test in the combined membership.",
+            "split_policy": "Create a fresh deterministic material-level split with seed 42. Assign every valid material exactly once. Greedily minimize normalized per-element site-row error against 80% train, 10% validation, and 10% test targets. Old split memberships, including conflicts, do not control assignment.",
             "target_policy": "Use positive Figshare raw spectrum column 4 and multiply by a per-element median scale estimated from matched Materials Cloud train records only (xsedge+50 / Bohr-radius-squared * 1000), then interpolate to 141 points",
             "source_manifest_status_counts": source_counts,
             "materialscloud_train_scale_calibration": element_scales,
-            "figshare_only_material_site_rows_assigned_to_train": figshare_only_material_site_count,
-            "figshare_material_site_rows_omitted_due_to_conflicting_existing_splits": conflicting_material_site_count,
-            "existing_material_ids_with_cross_element_split_conflicts": {
-                material_id: sorted(partitions)
-                for material_id, partitions in sorted(globally_conflicted_materials.items())
-            },
+            "split_seed": SPLIT_SEED,
+            "target_fractions": SPLIT_FRACTIONS,
+            "assigned_site_rows_by_element_and_split": assigned_counts,
+            "figshare_only_material_site_rows": figshare_only_material_site_count,
+            "previously_conflicting_material_site_rows_assigned": conflicting_material_site_count,
+            "previously_conflicting_material_count": len(globally_conflicted_materials),
             "written_rows_by_element_and_split": output_counts,
             "omitted_site_count": len(omissions),
         }
