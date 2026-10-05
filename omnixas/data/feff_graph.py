@@ -273,6 +273,7 @@ class CachedGraphDataset(Dataset):
 class CollateGraphs:
     def __init__(self, encoder, prebuilt: bool = False):
         self.converter = Structure2Graph(encoder.element_types, encoder.cutoff)
+        self.element_types = tuple(encoder.element_types)
         self.threebody_cutoff = encoder.threebody_cutoff
         self.prebuilt = prebuilt
         self.task_idx = {task: i for i, task in enumerate(FEFF_TASKS)}
@@ -321,6 +322,22 @@ class CollateGraphs:
                     if len(self._graph_cache) > GRAPH_CACHE_MAX:
                         self._graph_cache.popitem(last=False)
                 graph, line_graph = self._graph_cache[key]
+            node_count = graph.num_nodes()
+            if site < 0 or site >= node_count:
+                raise ValueError(
+                    f"Absorbing site is outside the graph for {task} {mid}_{site:03d}: "
+                    f"site index {site}, graph has {node_count} nodes"
+                )
+            node_type = graph.ndata["node_type"]
+            if node_type.numel():
+                min_type = int(node_type.min())
+                max_type = int(node_type.max())
+                if min_type < 0 or max_type >= len(self.element_types):
+                    raise ValueError(
+                        f"Element index is outside the M3GNet vocabulary for {task} "
+                        f"{mid}_{site:03d}: node_type range [{min_type}, {max_type}], "
+                        f"vocabulary size {len(self.element_types)}"
+                    )
             graphs.append(graph)
             line_graphs.append(line_graph)
             sites.append(offset + site)

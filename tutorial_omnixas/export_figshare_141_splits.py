@@ -28,6 +28,8 @@ Requires Python 3.10+ and NumPy only.
 
 from __future__ import annotations
 
+import argparse
+import ast
 import csv
 import json
 from pathlib import Path, PurePosixPath
@@ -73,6 +75,62 @@ def repository_root() -> Path:
 
 def data_root() -> Path:
     return Path(__file__).resolve().parents[2] / "OmniXAS_data"
+
+
+def default_spectral_npz() -> Path | None:
+    candidates = sorted(data_root().parent.glob("drive-download*/final_spectral_data.npz"))
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def default_spectral_key_file(repo: Path) -> Path:
+    return repo / "tutorial_omnixas" / "final_spectral_npz_keys.tsv"
+
+
+def read_spectral_key_file(path: Path) -> set[tuple[str, str, int]]:
+    """Read the tracked key list derived from final_spectral_data.npz."""
+    if not path.is_file():
+        raise ExportError(f"Missing spectral key whitelist: {path}")
+    result: set[tuple[str, str, int]] = set()
+    for line_number, raw in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        fields = line.split("\t")
+        if len(fields) != 3:
+            raise ExportError(f"Expected element, material ID, and site at {path}:{line_number}")
+        element, material_id, site_text = fields
+        try:
+            key = (element, material_id, int(site_text))
+        except ValueError as exc:
+            raise ExportError(f"Invalid spectral key at {path}:{line_number}: {line!r}") from exc
+        result.add(key)
+    if not result:
+        raise ExportError(f"Spectral key whitelist is empty: {path}")
+    return result
+
+
+def read_npz_whitelist(path: Path) -> set[tuple[str, str, int]]:
+    """Read tuple keys without loading the large NPZ arrays."""
+    if not path.is_file():
+        raise ExportError(f"Missing spectral NPZ whitelist: {path}")
+    try:
+        with np.load(path, allow_pickle=False) as archive:
+            names = archive.files
+    except (OSError, ValueError) as exc:
+        raise ExportError(f"Could not read spectral NPZ whitelist {path}: {exc}") from exc
+    result: set[tuple[str, str, int]] = set()
+    for name in names:
+        key_text = name[:-4] if name.endswith(".npy") else name
+        try:
+            key = ast.literal_eval(key_text)
+            element, material_id, site = key
+            key = (str(element), str(material_id), int(site))
+        except (ValueError, SyntaxError, TypeError) as exc:
+            raise ExportError(f"Invalid spectral NPZ key in {path}: {name!r}") from exc
+        result.add(key)
+    if not result:
+        raise ExportError(f"Spectral NPZ whitelist is empty: {path}")
+    return result
 
 
 def read_material_splits(
@@ -211,11 +269,44 @@ def write_rows(path: Path, rows: list[np.ndarray]) -> None:
     np.savetxt(path, matrix, fmt="%.18e")
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--spectral-key-file",
+        type=Path,
+        default=None,
+        help="Tracked TSV key list derived from final_spectral_data.npz. Defaults to tutorial_omnixas/final_spectral_npz_keys.tsv.",
+    )
+    parser.add_argument(
+        "--spectral-npz",
+        type=Path,
+        default=None,
+        help="Optional source NPZ for local key-list verification or key extraction.",
+    )
+    args = parser.parse_args(argv)
     repo = repository_root()
     root = data_root()
     source_root = root / "figshare"
     output_root = root / "figshare_141_splits"
+    key_file = args.spectral_key_file or default_spectral_key_file(repo)
+    if args.spectral_npz is not None:
+        spectral_keys = read_npz_whitelist(args.spectral_npz.resolve())
+        spectral_key_source = str(args.spectral_npz.resolve())
+        spectral_key_source_type = "npz"
+    elif key_file.is_file():
+        spectral_keys = read_spectral_key_file(key_file)
+        spectral_key_source = str(key_file.resolve())
+        spectral_key_source_type = "tracked_npz_key_list"
+    else:
+        spectral_npz = default_spectral_npz()
+        if spectral_npz is None:
+            raise SystemExit(
+                "Missing the tracked NPZ key list and final_spectral_data.npz. "
+                "Pass --spectral-key-file or --spectral-npz."
+            )
+        spectral_keys = read_npz_whitelist(spectral_npz)
+        spectral_key_source = str(spectral_npz.resolve())
+        spectral_key_source_type = "npz"
     manifest_path = source_root / "manifest.csv"
     if not manifest_path.is_file():
         raise SystemExit(f"Missing Figshare extraction manifest: {manifest_path}")
@@ -250,12 +341,20 @@ def main() -> int:
         valid_records: dict[str, list[tuple[str, int, np.ndarray]]] = {}
         omissions: list[dict[str, str]] = []
         source_counts: dict[str, int] = {}
+        manifest_keys: set[tuple[str, str, int]] = set()
+        npz_excluded_site_count = 0
+        manifest_rows_seen = 0
+        whitelist_rows_seen = 0
+        sampled_rows = 0
         with manifest_path.open(newline="", encoding="utf-8-sig") as handle:
             reader = csv.DictReader(handle)
             required = {"element", "material_id", "site", "status", "site_directory", "raw_candidate_count"}
             if reader.fieldnames is None or not required.issubset(reader.fieldnames):
                 raise ExportError(f"Unexpected extraction manifest columns in {manifest_path}")
             for row in reader:
+                manifest_rows_seen += 1
+                if manifest_rows_seen % 50000 == 0:
+                    print(f"Read {manifest_rows_seen:,} manifest rows; sampled {sampled_rows:,} whitelisted rows", flush=True)
                 element = row["element"]
                 if element not in ELEMENT_START_EV:
                     continue
@@ -264,6 +363,11 @@ def main() -> int:
                 material_id = row["material_id"]
                 site = int(row["site"])
                 key = (element, material_id, site)
+                manifest_keys.add(key)
+                if key not in spectral_keys:
+                    npz_excluded_site_count += 1
+                    continue
+                whitelist_rows_seen += 1
                 if status != "matched" or int(row["raw_candidate_count"]) != 1:
                     omissions.append({"key": repr(key), "reason": f"source_status_{status}"})
                     continue
@@ -279,7 +383,17 @@ def main() -> int:
                     omissions.append({"key": repr(key), "reason": str(exc)})
                     continue
                 valid_records.setdefault(material_id, []).append((element, site, y))
+                sampled_rows += 1
+                if sampled_rows % 5000 == 0:
+                    print(f"Sampled {sampled_rows:,} whitelisted raw spectra", flush=True)
 
+        configured_npz_keys = {key for key in spectral_keys if key[0] in ELEMENT_START_EV}
+        missing_manifest_keys = configured_npz_keys - manifest_keys
+        if missing_manifest_keys:
+            raise ExportError(
+                f"The spectral NPZ whitelist has {len(missing_manifest_keys)} configured keys "
+                f"missing from the Figshare manifest, for example {sorted(missing_manifest_keys)[:3]}"
+            )
         split_by_material, assigned_counts = assign_material_splits(valid_records)
         conflicting_material_site_count = sum(
             len(valid_records[material_id])
@@ -366,6 +480,14 @@ def main() -> int:
 
         report = {
             "source": str(source_root.resolve()),
+            "spectral_key_source": spectral_key_source,
+            "spectral_key_source_type": spectral_key_source_type,
+            "spectral_npz_key_count": len(spectral_keys),
+            "configured_element_npz_key_count": len(configured_npz_keys),
+            "npz_excluded_manifest_site_rows": npz_excluded_site_count,
+            "manifest_rows_seen": manifest_rows_seen,
+            "whitelist_rows_seen": whitelist_rows_seen,
+            "sampled_rows": sampled_rows,
             "existing_split_ids": str((repo / "tutorial_omnixas" / "material_id_and_site").resolve()),
             "output": str(output_root.resolve()),
             "elements": list(ELEMENT_START_EV),
@@ -376,7 +498,8 @@ def main() -> int:
                 "element_start_ev": ELEMENT_START_EV,
                 "endpoint_policy": "numpy.interp endpoint carry-forward; constant nearest measured value if no source points fall inside the window",
             },
-            "split_policy": "Create a fresh deterministic material-level split with seed 42. Assign every valid material exactly once. Greedily minimize normalized per-element site-row error against 80% train, 10% validation, and 10% test targets. Old split memberships, including conflicts, do not control assignment.",
+            "structure_whitelist_policy": "Use tuple keys from final_spectral_data.npz as the structure/site whitelist before source-spectrum filtering. Only the eight configured FEFF elements are exported.",
+            "split_policy": "Create a fresh deterministic material-level split with seed 42. Assign every valid whitelisted material exactly once. Greedily minimize normalized per-element site-row error against 80% train, 10% validation, and 10% test targets. Old split memberships, including conflicts, do not control assignment.",
             "target_policy": "Use positive Figshare raw spectrum column 4 and multiply by a per-element median scale estimated from matched Materials Cloud train records only (xsedge+50 / Bohr-radius-squared * 1000), then interpolate to 141 points",
             "source_manifest_status_counts": source_counts,
             "materialscloud_train_scale_calibration": element_scales,

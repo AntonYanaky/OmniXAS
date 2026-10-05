@@ -34,7 +34,7 @@ import torch
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 from lightning.pytorch.loggers import CSVLogger
 from torch.utils.data import DataLoader
-from tqdm.auto import tqdm
+from tqdm import tqdm
 
 from omnixas.model.m3gnet_xas import (
     FEATURE_DIM,
@@ -486,6 +486,13 @@ def main() -> None:
 
     encoder_path = run / "best_encoder.ckpt"
     if not encoder_path.exists():
+        resume_checkpoint = run / "encoder_checkpoints" / "last.ckpt"
+        if args.resume and not resume_checkpoint.is_file():
+            raise FileNotFoundError(
+                f"Cannot resume encoder training: missing checkpoint {resume_checkpoint}. "
+                "The interrupted run did not save a resumable encoder checkpoint; "
+                "start a fresh run with a new --run-name or use --overwrite."
+            )
         model = M3GNetXAS(); collate = CollateGraphs(model.encoder, prebuilt=graph_cache is not None); train_ds = make_graph_dataset(FEFF_TASKS, "train", model.encoder)
         task_counts = {task: sum(row[0] == task for row in train_ds.rows) for task in FEFF_TASKS}
         rows_per_element = min(args.encoder_rows_per_element, min(task_counts.values()))
@@ -504,7 +511,7 @@ def main() -> None:
         )
         cb = ModelCheckpoint(run / "encoder_checkpoints", filename="best-{epoch:03d}-{val_balanced_rel_mse:.5f}", monitor="val_balanced_rel_mse", mode="min", save_top_k=1, save_last=True)
         trainer = pl.Trainer(max_epochs=args.encoder_epochs, accelerator="auto", devices=1, precision=args.precision, callbacks=[cb, EarlyStopping(monitor="val_balanced_rel_mse", patience=60, mode="min")], logger=CSVLogger(str(run), name="encoder_logs"), log_every_n_steps=10)
-        trainer.fit(LitScratch(model, train_base, val_base, args.encoder_lr), train_loader, val_loader, ckpt_path=str(run / "encoder_checkpoints/last.ckpt") if args.resume and (run / "encoder_checkpoints/last.ckpt").exists() else None)
+        trainer.fit(LitScratch(model, train_base, val_base, args.encoder_lr), train_loader, val_loader, ckpt_path=str(resume_checkpoint) if args.resume else None)
         if not cb.best_model_path: raise RuntimeError("Encoder training produced no validation checkpoint")
         shutil.copy2(cb.best_model_path, encoder_path)
     features = run / "features"; features.mkdir(exist_ok=True); missing = missing_feature_splits(features, FEFF_TASKS)
