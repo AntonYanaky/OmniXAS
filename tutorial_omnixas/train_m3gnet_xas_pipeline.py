@@ -66,6 +66,8 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--run-name", default=None)
     p.add_argument("--output-root", default="output/training/m3gnet_xas_pipeline")
+    p.add_argument("--dataset-root", default=None, help="Directory containing material_id_and_site and ml_data. Defaults to repository tutorial_omnixas.")
+    p.add_argument("--raw-root", default=None, help="Directory containing FEFF structures. Defaults to OMNIXAS_DATA_ROOT materialscloud extraction.")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--gpu", default=None)
     p.add_argument("--resume", action="store_true")
@@ -93,9 +95,9 @@ def project_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
-def preflight(root: Path, raw: Path, require_raw: bool = True) -> None:
-    data = root / "tutorial_omnixas/ml_data"
-    ids_dir = root / "tutorial_omnixas/material_id_and_site"
+def preflight(root: Path, dataset: Path, raw: Path, require_raw: bool = True) -> None:
+    data = dataset / "ml_data"
+    ids_dir = dataset / "material_id_and_site"
     counts: dict[str, int] = {}
     missing: list[str] = []
     material_sets: dict[str, set[str]] = {}
@@ -104,7 +106,7 @@ def preflight(root: Path, raw: Path, require_raw: bool = True) -> None:
             x_path = data / f"{task}_{split}_X.txt"
             y_path = data / f"{task}_{split}_y.txt"
             id_path = ids_dir / f"{task}_{split}.txt"
-            paths = (x_path, y_path, id_path)
+            paths = (y_path, id_path)
             if not all(path.is_file() for path in paths):
                 missing.extend(str(path) for path in paths if not path.is_file())
     if missing:
@@ -115,17 +117,20 @@ def preflight(root: Path, raw: Path, require_raw: bool = True) -> None:
             x_path = data / f"{task}_{split}_X.txt"
             y_path = data / f"{task}_{split}_y.txt"
             id_path = ids_dir / f"{task}_{split}.txt"
-            X = np.atleast_2d(np.loadtxt(x_path, dtype=np.float32))
+            X = np.atleast_2d(np.loadtxt(x_path, dtype=np.float32)) if x_path.is_file() else None
             y = np.atleast_2d(np.loadtxt(y_path, dtype=np.float32))
             rows = [line.strip() for line in id_path.read_text(encoding="utf-8").splitlines() if line.strip()]
             if len(rows) != len(set(rows)):
                 raise ValueError(f"Duplicate full IDs in {id_path}")
-            if X.shape != (len(rows), FEATURE_DIM):
-                raise ValueError(f"Feature/ID order or shape mismatch for {task} {split}: X={X.shape}, IDs={len(rows)}")
+            if x_path.is_file():
+                if X.shape != (len(rows), FEATURE_DIM):
+                    raise ValueError(f"Feature/ID order or shape mismatch for {task} {split}: X={X.shape}, IDs={len(rows)}")
+                if not np.isfinite(X).all():
+                    raise ValueError(f"Non-finite feature value for {task} {split}")
             if y.shape != (len(rows), SPECTRUM_DIM):
                 raise ValueError(f"Target/ID order or shape mismatch for {task} {split}: y={y.shape}, IDs={len(rows)}")
-            if not np.isfinite(X).all() or not np.isfinite(y).all():
-                raise ValueError(f"Non-finite feature or target value for {task} {split}")
+            if not np.isfinite(y).all():
+                raise ValueError(f"Non-finite target value for {task} {split}")
             material_sets[f"{task}:{split}"] = {row.rsplit("_", 1)[0] for row in rows}
             if split == "train": counts[task] = len(rows)
         for left, right in (("train", "val"), ("train", "test"), ("val", "test")):
@@ -140,7 +145,7 @@ def preflight(root: Path, raw: Path, require_raw: bool = True) -> None:
     if require_raw:
         if not raw.is_dir():
             raise FileNotFoundError(f"Missing raw FEFF structure root: {raw}. Set OMNIXAS_DATA_ROOT.")
-        validate_raw_structures(root, raw, FEFF_TASKS)
+        validate_raw_structures(root, raw, FEFF_TASKS, dataset)
     print("preflight passed: no training was started")
 
 
@@ -206,8 +211,8 @@ class LitScratch(pl.LightningModule):
         }
 
 
-def baselines(root: Path) -> tuple[torch.Tensor, torch.Tensor]:
-    d = root / "tutorial_omnixas/ml_data"; train, val = [], []
+def baselines(dataset: Path) -> tuple[torch.Tensor, torch.Tensor]:
+    d = dataset / "ml_data"; train, val = [], []
     for task in FEFF_TASKS:
         ty = np.atleast_2d(np.loadtxt(d / f"{task}_train_y.txt", dtype=np.float32)); mean = ty.mean(0)
         train.append(np.median(((ty - mean) ** 2).mean(1)))
@@ -237,8 +242,8 @@ def evaluate_head(head: XASSpectralHead, X: np.ndarray, y: np.ndarray, train_y: 
         "eta": float(baseline / max(np.median(mse), 1e-12)),
     }
 
-def validate_features(features: Path, root: Path) -> None:
-    canonical = root / "tutorial_omnixas/ml_data"
+def validate_features(features: Path, dataset: Path) -> None:
+    canonical = dataset / "ml_data"
     for task in FEFF_TASKS:
         split = load_feature_split(features, task)
         for name in SPLITS:
@@ -405,6 +410,9 @@ def main() -> None:
     if args.evaluate and args.resume: raise ValueError("--evaluate cannot be combined with --resume")
     if args.gpu is not None: os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
     root = project_root()
+    dataset = Path(args.dataset_root) if args.dataset_root else root / "tutorial_omnixas"
+    if not dataset.is_absolute():
+        dataset = root / dataset
     output = Path(args.output_root); output = output if output.is_absolute() else root / output
     if (args.resume or args.evaluate) and args.run_name is None:
         raise ValueError("--resume and --evaluate require --run-name")
@@ -423,13 +431,15 @@ def main() -> None:
         ]
         if missing:
             raise FileNotFoundError("Completed run is missing feature artifacts:\n" + "\n".join(missing[:12]))
-        validate_features(features, root)
+        validate_features(features, dataset)
         write_evaluations(run, features, args)
         print(f"evaluation complete: {run}")
         return
     if args.resume and not run.is_dir():
         raise FileNotFoundError(f"Cannot resume missing run directory: {run}")
-    raw = Path(os.environ.get("OMNIXAS_DATA_ROOT", root.parent / "OmniXAS_data")) / "materialscloud_omnixas_raw" / "extracted"
+    raw = Path(args.raw_root) if args.raw_root else Path(os.environ.get("OMNIXAS_DATA_ROOT", root.parent / "OmniXAS_data")) / "materialscloud_omnixas_raw" / "extracted"
+    if not raw.is_absolute():
+        raw = root / raw
     if args.graph_cache and args.precompute_graphs:
         raise ValueError("Use either --graph-cache or --precompute-graphs, not both")
     graph_cache = Path(args.graph_cache) if args.graph_cache else None
@@ -447,7 +457,7 @@ def main() -> None:
             raise ValueError("--graph-cache loads the graph set once into the main process; use --num-workers 0")
         if not graph_cache.is_dir():
             raise FileNotFoundError(f"Missing graph cache directory: {graph_cache}. Run tutorial_omnixas/precompute_feff_graphs.py first.")
-    patch_matgl_gpu_constants(); preflight(root, raw, require_raw=graph_cache is None)
+    patch_matgl_gpu_constants(); preflight(root, dataset, raw, require_raw=graph_cache is None)
     if args.preflight: return
     if args.overwrite and run.exists(): shutil.rmtree(run)
     if run.exists() and not args.resume: raise FileExistsError(f"Run exists: {run}; use --resume or --overwrite")
@@ -464,15 +474,15 @@ def main() -> None:
             "selection": "validation loss/eta only. Test metrics are reported after selection.",
             "args": vars(args),
         }, indent=2), encoding="utf-8")
-    train_base, val_base = baselines(root)
+    train_base, val_base = baselines(dataset)
     graph_loader_kwargs = {"num_workers": args.num_workers}
     if args.num_workers > 0:
         graph_loader_kwargs.update(persistent_workers=True, prefetch_factor=args.prefetch_factor)
 
     def make_graph_dataset(tasks, split, encoder):
         if graph_cache is not None:
-            return CachedGraphDataset(root, graph_cache, tasks, split, encoder.cutoff, encoder.threebody_cutoff, encoder.element_types)
-        return FEFFDataset(root, raw, tasks, split)
+            return CachedGraphDataset(root, graph_cache, tasks, split, encoder.cutoff, encoder.threebody_cutoff, encoder.element_types, dataset)
+        return FEFFDataset(root, raw, tasks, split, dataset)
 
     encoder_path = run / "best_encoder.ckpt"
     if not encoder_path.exists():
@@ -515,7 +525,7 @@ def main() -> None:
                 xs.append(model.encode(b["graph"].to(device), b["line_graph"].to(device), b["site"].to(device), scaled=True).cpu().numpy())
                 ys.append(b["y"].numpy())
             X, y = np.concatenate(xs), np.concatenate(ys); np.savetxt(features / f"{task}_{split}_X.txt", X); np.savetxt(features / f"{task}_{split}_y.txt", y)
-    validate_features(features, root)
+    validate_features(features, dataset)
     ux, uy, uvx, uvy = balanced_universal(features, args.seed)
     universal = train_head(run / "heads/universalXAS", ux, uy, uvx, uvy, None, args, lr=5e-4, epochs=args.head_epochs, schedule="plateau", es_metric="mean", label="UniversalXAS")
     universal_state = load_state(universal)

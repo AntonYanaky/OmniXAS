@@ -33,9 +33,10 @@ GRAPH_CACHE_MAX = 1024
 GRAPH_CACHE_FORMAT = 1
 
 
-def load_id_rows(root: Path, task: str, split: str) -> list[tuple[str, int]]:
-    """Read (material_id, site) rows for one task/split from the canonical ID file."""
-    path = Path(root) / "tutorial_omnixas" / "material_id_and_site" / f"{task}_{split}.txt"
+def load_id_rows(root: Path, task: str, split: str, dataset_root: Path | None = None) -> list[tuple[str, int]]:
+    """Read (material_id, site) rows for one task/split."""
+    dataset = Path(dataset_root) if dataset_root is not None else Path(root) / "tutorial_omnixas"
+    path = dataset / "material_id_and_site" / f"{task}_{split}.txt"
     if not path.is_file():
         raise FileNotFoundError(f"Missing identifier file: {path}")
     rows = [line.strip() for line in path.read_text(errors="ignore").splitlines() if line.strip()]
@@ -154,15 +155,20 @@ def parse_feff_structure(path: Path) -> Structure:
 def structure_path(raw_root: Path, task: str, material_id: str, site: int) -> Path:
     element, kind = task.split("_", 1)
     material_dir = raw_root / kind / element / material_id
-    poscar = material_dir / "POSCAR"
-    if poscar.exists():
-        return poscar
+    for path in (
+        material_dir / "POSCAR",
+        material_dir / "FEFF-XANES" / f"{site:03d}_{element}" / "POSCAR",
+        material_dir / "FEFF-XANES" / f"{site:03d}_{element}" / "feff.inp",
+    ):
+        if path.exists():
+            return path
     return material_dir / "FEFF-XANES" / f"{site:03d}_{element}" / "feff.inp"
 
 
-def validate_raw_structures(root: Path, raw_root: Path, tasks: list[str]) -> None:
+def validate_raw_structures(root: Path, raw_root: Path, tasks: list[str], dataset_root: Path | None = None) -> None:
     missing = []
-    id_dir = root / "tutorial_omnixas" / "material_id_and_site"
+    dataset = Path(dataset_root) if dataset_root is not None else Path(root) / "tutorial_omnixas"
+    id_dir = dataset / "material_id_and_site"
     for task in tasks:
         for split in SPLITS:
             id_path = id_dir / f"{task}_{split}.txt"
@@ -180,13 +186,14 @@ def validate_raw_structures(root: Path, raw_root: Path, tasks: list[str]) -> Non
 
 
 class FEFFDataset(Dataset):
-    def __init__(self, root: Path, raw_root: Path, tasks: list[str], split: str):
+    def __init__(self, root: Path, raw_root: Path, tasks: list[str], split: str, dataset_root: Path | None = None):
         if split not in SPLITS:
             raise ValueError(f"Unsupported split: {split}")
         self.raw_root, self.rows, self.cache = raw_root, [], {}
-        data_dir = root / "tutorial_omnixas" / "ml_data"
+        dataset = Path(dataset_root) if dataset_root is not None else Path(root) / "tutorial_omnixas"
+        data_dir = dataset / "ml_data"
         for task in tasks:
-            ids = load_id_rows(root, task, split)
+            ids = load_id_rows(root, task, split, dataset)
             y = np.atleast_2d(np.loadtxt(data_dir / f"{task}_{split}_y.txt", dtype=np.float32))
             if len(ids) != len(y):
                 raise ValueError(f"Split length mismatch for {task} {split}: ids={len(ids)} y={len(y)}")
@@ -218,16 +225,17 @@ class CachedGraphDataset(Dataset):
     use DataLoader num_workers=0 so the set is not duplicated per worker.
     """
 
-    def __init__(self, root: Path, cache_dir: Path, tasks: list[str], split: str, cutoff: float, threebody_cutoff: float, element_types):
+    def __init__(self, root: Path, cache_dir: Path, tasks: list[str], split: str, cutoff: float, threebody_cutoff: float, element_types, dataset_root: Path | None = None):
         if split not in SPLITS:
             raise ValueError(f"Unsupported split: {split}")
         self.cache_dir = Path(cache_dir)
         self.rows: list[tuple[str, object, int, torch.Tensor]] = []
         self.pairs: list[tuple] = []
-        data_dir = root / "tutorial_omnixas" / "ml_data"
+        dataset = Path(dataset_root) if dataset_root is not None else Path(root) / "tutorial_omnixas"
+        data_dir = dataset / "ml_data"
         expected = build_graph_header(cutoff, threebody_cutoff, element_types)
         for task in tasks:
-            ids = load_id_rows(root, task, split)
+            ids = load_id_rows(root, task, split, dataset)
             y = np.atleast_2d(np.loadtxt(data_dir / f"{task}_{split}_y.txt", dtype=np.float32))
             if len(ids) != len(y):
                 raise ValueError(f"Split length mismatch for {task} {split}: ids={len(ids)} y={len(y)}")
