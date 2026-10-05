@@ -32,6 +32,7 @@ import argparse
 import ast
 import csv
 import json
+import os
 from pathlib import Path, PurePosixPath
 import sys
 
@@ -74,7 +75,8 @@ def repository_root() -> Path:
 
 
 def data_root() -> Path:
-    return Path(__file__).resolve().parents[2] / "OmniXAS_data"
+    default = Path(__file__).resolve().parents[2] / "OmniXAS_data"
+    return Path(os.environ.get("OMNIXAS_DATA_ROOT", default)).expanduser()
 
 
 def default_spectral_npz() -> Path | None:
@@ -389,11 +391,6 @@ def main(argv: list[str] | None = None) -> int:
 
         configured_npz_keys = {key for key in spectral_keys if key[0] in ELEMENT_START_EV}
         missing_manifest_keys = configured_npz_keys - manifest_keys
-        if missing_manifest_keys:
-            raise ExportError(
-                f"The spectral NPZ whitelist has {len(missing_manifest_keys)} configured keys "
-                f"missing from the Figshare manifest, for example {sorted(missing_manifest_keys)[:3]}"
-            )
         split_by_material, assigned_counts = assign_material_splits(valid_records)
         conflicting_material_site_count = sum(
             len(valid_records[material_id])
@@ -484,6 +481,8 @@ def main(argv: list[str] | None = None) -> int:
             "spectral_key_source_type": spectral_key_source_type,
             "spectral_npz_key_count": len(spectral_keys),
             "configured_element_npz_key_count": len(configured_npz_keys),
+            "missing_whitelist_manifest_site_rows": len(missing_manifest_keys),
+            "missing_whitelist_manifest_examples": [list(key) for key in sorted(missing_manifest_keys)[:10]],
             "npz_excluded_manifest_site_rows": npz_excluded_site_count,
             "manifest_rows_seen": manifest_rows_seen,
             "whitelist_rows_seen": whitelist_rows_seen,
