@@ -30,7 +30,6 @@ FEFF_TASKS = ["Ti_FEFF", "V_FEFF", "Cr_FEFF", "Mn_FEFF", "Fe_FEFF", "Co_FEFF", "
 SPLITS = ("train", "val", "test")
 ENCODER_BATCH = 24
 GRAPH_CACHE_MAX = 1024
-GRAPH_CACHE_FORMAT = 1
 
 
 def load_id_rows(root: Path, task: str, split: str, dataset_root: Path | None = None) -> list[tuple[str, int]]:
@@ -41,51 +40,6 @@ def load_id_rows(root: Path, task: str, split: str, dataset_root: Path | None = 
         raise FileNotFoundError(f"Missing identifier file: {path}")
     rows = [line.strip() for line in path.read_text(errors="ignore").splitlines() if line.strip()]
     return [(mid, int(site)) for mid, site in (row.rsplit("_", 1) for row in rows)]
-
-
-def graph_library_versions() -> dict[str, str]:
-    import importlib.metadata
-
-    def version(name: str) -> str:
-        try:
-            return importlib.metadata.version(name)
-        except Exception:
-            return "unknown"
-
-    return {"matgl": version("matgl"), "dgl": version("dgl"), "pymatgen": version("pymatgen"), "torch": torch.__version__}
-
-
-def feff_graph_sha() -> str:
-    import hashlib
-
-    return hashlib.sha256(Path(__file__).resolve().read_bytes()).hexdigest()
-
-
-def build_graph_header(cutoff: float, threebody_cutoff: float, element_types) -> dict:
-    """Header for precomputed graph cache files (precompute_feff_graphs.py)."""
-    header: dict = {
-        "format": GRAPH_CACHE_FORMAT,
-        "cutoff": float(cutoff),
-        "threebody_cutoff": float(threebody_cutoff),
-        "element_types": [str(e) for e in element_types],
-    }
-    header.update(graph_library_versions())
-    header["feff_graph_sha"] = feff_graph_sha()
-    return header
-
-
-def graph_header_problems(stored: dict, expected: dict) -> list[str]:
-    """Human-readable header mismatches. Empty list means the cache is compatible."""
-    problems: list[str] = []
-    for key in ("format", "cutoff", "threebody_cutoff"):
-        if stored.get(key) != expected.get(key):
-            problems.append(f"{key}: cache={stored.get(key)!r} current={expected.get(key)!r}")
-    if [str(e) for e in stored.get("element_types", [])] != [str(e) for e in expected.get("element_types", [])]:
-        problems.append("element_types differ")
-    for key in ("matgl", "dgl", "pymatgen", "torch", "feff_graph_sha"):
-        if stored.get(key) != expected.get(key):
-            problems.append(f"{key}: cache={stored.get(key)!r} current={expected.get(key)!r}")
-    return problems
 
 
 def patch_matgl_gpu_constants() -> None:
@@ -215,69 +169,11 @@ class FEFFDataset(Dataset):
         return task, mid, self.cache[key], site, y
 
 
-class CachedGraphDataset(Dataset):
-    """Dataset backed by precomputed (graph, line_graph) pairs.
-
-    ``cache_dir`` must hold one file per task/split written by
-    ``tutorial_omnixas/precompute_feff_graphs.py``. The stored header is
-    checked against the current cutoff, threebody_cutoff, element types,
-    library versions, and feff_graph.py hash; row counts and ID order are
-    checked against the canonical split ID files. Any mismatch raises: there
-    is no silent reuse of a stale cache. Graphs are loaded once into memory;
-    use DataLoader num_workers=0 so the set is not duplicated per worker.
-    """
-
-    def __init__(self, root: Path, cache_dir: Path, tasks: list[str], split: str, cutoff: float, threebody_cutoff: float, element_types, dataset_root: Path | None = None):
-        if split not in SPLITS:
-            raise ValueError(f"Unsupported split: {split}")
-        self.cache_dir = Path(cache_dir)
-        self.rows: list[tuple[str, object, int, torch.Tensor]] = []
-        self.pairs: list[tuple] = []
-        dataset = Path(dataset_root) if dataset_root is not None else Path(root) / "tutorial_omnixas"
-        data_dir = dataset / "ml_data"
-        expected = build_graph_header(cutoff, threebody_cutoff, element_types)
-        for task in tasks:
-            ids = load_id_rows(root, task, split, dataset)
-            y = np.atleast_2d(np.loadtxt(data_dir / f"{task}_{split}_y.txt", dtype=np.float32))
-            if len(ids) != len(y):
-                raise ValueError(f"Split length mismatch for {task} {split}: ids={len(ids)} y={len(y)}")
-            path = self.cache_dir / f"{task}_{split}.pt"
-            if not path.is_file():
-                raise FileNotFoundError(
-                    f"Missing graph cache file: {path}\n"
-                    f"Rerun: python tutorial_omnixas/precompute_feff_graphs.py "
-                    f"--out-dir {self.cache_dir} --cutoff {cutoff} --threebody-cutoff {threebody_cutoff}"
-                )
-            payload = torch.load(path, map_location="cpu", weights_only=False)
-            problems = graph_header_problems(payload.get("header", {}), expected)
-            cache_ids = payload.get("ids", [])
-            cache_pairs = payload.get("pairs", [])
-            if not (len(cache_ids) == len(ids) == len(cache_pairs)):
-                problems.append(f"row counts differ: id_file={len(ids)} cache_ids={len(cache_ids)} cache_pairs={len(cache_pairs)}")
-            elif [(str(mid), int(site)) for mid, site in cache_ids] != ids:
-                problems.append("material/site IDs or their order do not match the canonical split ID file")
-            if problems:
-                raise ValueError(
-                    f"Graph cache guard failed for {path}:\n  " + "\n  ".join(problems)
-                    + "\nRerun precompute_feff_graphs.py; do not reuse this cache."
-                )
-            self.rows += [(task, mid, site, torch.as_tensor(yi, dtype=torch.float32)) for (mid, site), yi in zip(ids, y, strict=True)]
-            self.pairs += list(cache_pairs)
-
-    def __len__(self):
-        return len(self.rows)
-
-    def __getitem__(self, idx):
-        task, mid, site, y = self.rows[idx]
-        return task, mid, self.pairs[idx], site, y
-
-
 class CollateGraphs:
-    def __init__(self, encoder, prebuilt: bool = False):
+    def __init__(self, encoder):
         self.converter = Structure2Graph(encoder.element_types, encoder.cutoff)
         self.element_types = tuple(encoder.element_types)
         self.threebody_cutoff = encoder.threebody_cutoff
-        self.prebuilt = prebuilt
         self.task_idx = {task: i for i, task in enumerate(FEFF_TASKS)}
         self._graph_cache: OrderedDict = OrderedDict()
 
@@ -307,23 +203,15 @@ class CollateGraphs:
         graphs, line_graphs, sites, tasks, y = [], [], [], [], []
         offset = 0
         for task, mid, item, site, yi in batch:
-            if self.prebuilt:
-                if not (isinstance(item, tuple) and len(item) == 2):
-                    raise TypeError(
-                        "prebuilt CollateGraphs received a raw structure, not a (graph, line_graph) pair; "
-                        "use CachedGraphDataset together with prebuilt=True"
-                    )
-                graph, line_graph = item
+            key = (task, mid, site)
+            # Figshare records for one material can carry site-specific structures.
+            if key in self._graph_cache:
+                self._graph_cache.move_to_end(key)
             else:
-                key = (task, mid, site)
-                # Figshare records for one material can carry site-specific structures.
-                if key in self._graph_cache:
-                    self._graph_cache.move_to_end(key)
-                else:
-                    self._graph_cache[key] = self._build_graphs(item)
-                    if len(self._graph_cache) > GRAPH_CACHE_MAX:
-                        self._graph_cache.popitem(last=False)
-                graph, line_graph = self._graph_cache[key]
+                self._graph_cache[key] = self._build_graphs(item)
+                if len(self._graph_cache) > GRAPH_CACHE_MAX:
+                    self._graph_cache.popitem(last=False)
+            graph, line_graph = self._graph_cache[key]
             node_count = graph.num_nodes()
             if site < 0 or site >= node_count:
                 raise ValueError(

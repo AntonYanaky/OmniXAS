@@ -19,7 +19,6 @@ import argparse
 import csv
 import json
 import os
-import sys
 
 # DGL must receive its backend before any MatGL import loads DGL.
 os.environ.setdefault("DGLBACKEND", "pytorch")
@@ -48,7 +47,6 @@ from omnixas.model.m3gnet_xas import (
 
 from omnixas.data.feff_graph import (
     BalancedTaskBatchSampler,
-    CachedGraphDataset,
     CollateGraphs,
     ENCODER_BATCH,
     FEFFDataset,
@@ -95,9 +93,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tuned-epochs", type=int, default=1000, help="tuned head max epochs")
     p.add_argument("--batch-size", type=int, default=96)
     p.add_argument("--prefetch-factor", type=int, default=2)
-    p.add_argument("--graph-cache", default=None, help="Directory of precomputed FEFF graphs from precompute_feff_graphs.py. Skips all on-the-fly graph building. Requires --num-workers 0 and a cache that passes the header/ID guard.")
-    p.add_argument("--precompute-graphs", action="store_true", help="Automatic graph cache mode: read cutoff/threebody_cutoff from the encoder this run uses, build/refresh the matching cache (one directory per setting), run the exact-build verification, then train from it with --num-workers 0. Existing valid files are skipped; stale files are rebuilt with a loud log.")
-    p.add_argument("--precompute-workers", type=int, default=32, help="Worker processes for --precompute-graphs")
     return p.parse_args()
 
 
@@ -105,7 +100,7 @@ def project_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
-def preflight(root: Path, dataset: Path, raw: Path, require_raw: bool = True) -> None:
+def preflight(root: Path, dataset: Path, raw: Path) -> None:
     data = dataset / "ml_data"
     ids_dir = dataset / "material_id_and_site"
     counts: dict[str, int] = {}
@@ -152,10 +147,9 @@ def preflight(root: Path, dataset: Path, raw: Path, require_raw: bool = True) ->
     params = sum(p.numel() for p in model.parameters())
     head_params = sum(p.numel() for p in XASSpectralHead().parameters())
     print(json.dumps({"train_rows": sum(counts.values()), "feature_dim": FEATURE_DIM, "spectrum_dim": SPECTRUM_DIM, "encoder_parameters": params, "head_parameters": head_params, "raw_root": str(raw), "raw_root_exists": raw.is_dir()}, indent=2))
-    if require_raw:
-        if not raw.is_dir():
-            raise FileNotFoundError(f"Missing raw FEFF structure root: {raw}. Set OMNIXAS_DATA_ROOT.")
-        validate_raw_structures(root, raw, FEFF_TASKS, dataset)
+    if not raw.is_dir():
+        raise FileNotFoundError(f"Missing raw FEFF structure root: {raw}. Set OMNIXAS_DATA_ROOT.")
+    validate_raw_structures(root, raw, FEFF_TASKS, dataset)
     print("preflight passed: no training was started")
 
 
@@ -513,24 +507,7 @@ def main() -> None:
     raw = Path(args.raw_root) if args.raw_root else Path(os.environ.get("OMNIXAS_DATA_ROOT", root.parent / "OmniXAS_data")) / "materialscloud_omnixas_raw" / "extracted"
     if not raw.is_absolute():
         raw = root / raw
-    if args.graph_cache and args.precompute_graphs:
-        raise ValueError("Use either --graph-cache or --precompute-graphs, not both")
-    graph_cache = Path(args.graph_cache) if args.graph_cache else None
-    if args.precompute_graphs:
-        # Automatic mode: derive the cache from the encoder settings this run uses.
-        sys.path.insert(0, str(Path(__file__).resolve().parent))
-        import precompute_feff_graphs as pgc
-        probe = M3GNetXAS().encoder
-        graph_cache = pgc.default_out_dir(root, probe.cutoff, probe.threebody_cutoff)
-        print(f"--precompute-graphs: encoder cutoff={probe.cutoff} threebody_cutoff={probe.threebody_cutoff}")
-        pgc.ensure_graph_cache(root, raw, graph_cache, probe.cutoff, probe.threebody_cutoff,
-                               workers=args.precompute_workers, rebuild_stale=True, verify=True)
-    if graph_cache is not None:
-        if args.num_workers > 0:
-            raise ValueError("--graph-cache loads the graph set once into the main process; use --num-workers 0")
-        if not graph_cache.is_dir():
-            raise FileNotFoundError(f"Missing graph cache directory: {graph_cache}. Run tutorial_omnixas/precompute_feff_graphs.py first.")
-    patch_matgl_gpu_constants(); preflight(root, dataset, raw, require_raw=graph_cache is None)
+    patch_matgl_gpu_constants(); preflight(root, dataset, raw)
     if args.preflight: return
     if args.overwrite and run.exists(): shutil.rmtree(run)
     if run.exists() and not args.resume: raise FileExistsError(f"Run exists: {run}; use --resume or --overwrite")
@@ -552,9 +529,7 @@ def main() -> None:
     if args.num_workers > 0:
         graph_loader_kwargs.update(persistent_workers=True, prefetch_factor=args.prefetch_factor)
 
-    def make_graph_dataset(tasks, split, encoder):
-        if graph_cache is not None:
-            return CachedGraphDataset(root, graph_cache, tasks, split, encoder.cutoff, encoder.threebody_cutoff, encoder.element_types, dataset)
+    def make_graph_dataset(tasks, split):
         return FEFFDataset(root, raw, tasks, split, dataset)
 
     encoder_path = run / "best_encoder.ckpt"
@@ -566,13 +541,13 @@ def main() -> None:
                 "The interrupted run did not save a resumable encoder checkpoint; "
                 "start a fresh run with a new --run-name or use --overwrite."
             )
-        model = M3GNetXAS(head_dropout=args.head_dropout); collate = CollateGraphs(model.encoder, prebuilt=graph_cache is not None); train_ds = make_graph_dataset(FEFF_TASKS, "train", model.encoder)
+        model = M3GNetXAS(head_dropout=args.head_dropout); collate = CollateGraphs(model.encoder); train_ds = make_graph_dataset(FEFF_TASKS, "train")
         task_counts = {task: sum(row[0] == task for row in train_ds.rows) for task in FEFF_TASKS}
         rows_per_element = min(args.encoder_rows_per_element, min(task_counts.values()))
         sampler = BalancedTaskBatchSampler(train_ds.rows, rows_per_element, args.seed)
         train_loader = DataLoader(train_ds, batch_sampler=sampler, collate_fn=collate, **graph_loader_kwargs)
         val_loader = DataLoader(
-            make_graph_dataset(FEFF_TASKS, "val", model.encoder),
+            make_graph_dataset(FEFF_TASKS, "val"),
             batch_size=args.encoder_eval_batch_size,
             collate_fn=collate,
             **graph_loader_kwargs,
@@ -591,11 +566,11 @@ def main() -> None:
     expected = [(task, split) for task in FEFF_TASKS for split in SPLITS]
     if missing and len(missing) != len(expected):
         raise RuntimeError("Feature directory is incomplete. Remove it only with --overwrite, then regenerate all features.")
-    model = M3GNetXAS(head_dropout=args.head_dropout); state = torch.load(encoder_path, map_location="cpu", weights_only=False)["state_dict"]; model.load_state_dict({k.removeprefix("model."): v for k, v in state.items() if k.startswith("model.")}, strict=True); model.eval(); device = torch.device("cuda" if torch.cuda.is_available() else "cpu"); model.to(device); collate = CollateGraphs(model.encoder, prebuilt=graph_cache is not None)
+    model = M3GNetXAS(head_dropout=args.head_dropout); state = torch.load(encoder_path, map_location="cpu", weights_only=False)["state_dict"]; model.load_state_dict({k.removeprefix("model."): v for k, v in state.items() if k.startswith("model.")}, strict=True); model.eval(); device = torch.device("cuda" if torch.cuda.is_available() else "cpu"); model.to(device); collate = CollateGraphs(model.encoder)
     with torch.inference_mode():
         for task, split in tqdm(missing, desc="M3GNet feature export", unit="split", disable=not missing):
             loader = DataLoader(
-                make_graph_dataset([task], split, model.encoder),
+                make_graph_dataset([task], split),
                 batch_size=args.encoder_eval_batch_size,
                 collate_fn=collate,
                 **graph_loader_kwargs,
