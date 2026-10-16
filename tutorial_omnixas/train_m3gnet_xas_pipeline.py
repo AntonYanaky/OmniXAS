@@ -39,6 +39,7 @@ from tqdm import tqdm
 from omnixas.model.m3gnet_xas import (
     FEATURE_DIM,
     FEATURE_SCALE,
+    DEFAULT_HEAD_DROPOUT,
     HEAD_HIDDEN_DIMS,
     SPECTRUM_DIM,
     M3GNetXAS,
@@ -82,6 +83,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--encoder-lr", type=float, default=1e-3)
     p.add_argument("--head-epochs", type=int, default=800, help="universal head max epochs")
     p.add_argument("--head-patience", type=int, default=60)
+    p.add_argument("--head-dropout", type=float, default=DEFAULT_HEAD_DROPOUT)
+    p.add_argument("--universal-lr", type=float, default=5e-4)
+    p.add_argument("--universal-loss-balance-power", type=float, default=0.0)
+    p.add_argument("--universal-seed", type=int, default=None)
+    p.add_argument("--universal-es-metric", choices=("mean", "macro_relative_median"), default="mean")
+    p.add_argument("--tuned-lr", type=float, default=3e-4)
+    p.add_argument("--tuned-seed", type=int, default=None)
+    p.add_argument("--tuned-schedule", choices=("plateau", "cosine"), default="cosine")
+    p.add_argument("--tuned-loss-normalize", action="store_true", help="divide tuned-head MSE loss by its train-only baseline median MSE")
     p.add_argument("--tuned-epochs", type=int, default=1000, help="tuned head max epochs")
     p.add_argument("--batch-size", type=int, default=96)
     p.add_argument("--prefetch-factor", type=int, default=2)
@@ -257,18 +267,44 @@ def validate_features(features: Path, dataset: Path) -> None:
                 raise ValueError(f"Exported targets do not exactly match canonical targets: {task} {name}")
 
 
-def balanced_universal(features: Path, seed: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def balanced_universal(features: Path, seed: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     splits = [load_feature_split(features, task) for task in FEFF_TASKS]
     n = max(len(s.train) for s in splits); rng = np.random.default_rng(seed)
     sampled = [rng.integers(len(s.train), size=n) for s in splits]
     train = [s.train.X[index] for s, index in zip(splits, sampled, strict=True)]
     y = [s.train.y[index] for s, index in zip(splits, sampled, strict=True)]
-    return np.concatenate(train), np.concatenate(y), np.concatenate([s.val.X for s in splits]), np.concatenate([s.val.y for s in splits])
+    train_task = [np.full(n, i, dtype=np.int64) for i in range(len(splits))]
+    val_task = [np.full(len(s.val), i, dtype=np.int64) for i, s in enumerate(splits)]
+    return (
+        np.concatenate(train), np.concatenate(y), np.concatenate(train_task),
+        np.concatenate([s.val.X for s in splits]), np.concatenate([s.val.y for s in splits]),
+        np.concatenate(val_task),
+    )
 
 
-def train_head(out: Path, X: np.ndarray, y: np.ndarray, val_X: np.ndarray, val_y: np.ndarray, source: dict | None, args: argparse.Namespace, *, lr: float, epochs: int, schedule: str, es_metric: str, label: str) -> Path:
-    # settings ported from the balanced-activation pipeline best run (plain Adam, no weight decay)
-    # patience=16 emulates the old pipeline's plateau (checked every 2 epochs with patience 8): identical LR-reduction timing (no improvement for 16 epochs)
+def train_head(
+    out: Path,
+    X: np.ndarray,
+    y: np.ndarray,
+    val_X: np.ndarray,
+    val_y: np.ndarray,
+    source: dict | None,
+    args: argparse.Namespace,
+    *,
+    lr: float,
+    epochs: int,
+    schedule: str,
+    es_metric: str,
+    label: str,
+    dropout: float = DEFAULT_HEAD_DROPOUT,
+    loss_balance_power: float = 0.0,
+    train_task: np.ndarray | None = None,
+    val_task: np.ndarray | None = None,
+    task_train_base: np.ndarray | None = None,
+    loss_scale: float | None = None,
+    seed: int | None = None,
+) -> Path:
+    # The established head optimizer is Adam without weight decay.
     checkpoint = out / "best.pt"
     if out.exists() and not checkpoint.exists():
         raise RuntimeError(f"Head directory is incomplete and will not be reused: {out}")
@@ -276,31 +312,38 @@ def train_head(out: Path, X: np.ndarray, y: np.ndarray, val_X: np.ndarray, val_y
     if checkpoint.exists():
         print(f"[{label}] reusing existing checkpoint: {checkpoint}", flush=True)
         return checkpoint
+    if seed is not None:
+        random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+        if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
+    if loss_balance_power != 0 and (train_task is None or task_train_base is None):
+        raise ValueError("Balanced universal loss requires task IDs and training-only baseline scales")
+    if es_metric == "macro_relative_median" and (val_task is None or task_train_base is None):
+        raise ValueError("Macro-relative validation requires validation task IDs and training-only scales")
+    if es_metric == "median_relative" and (loss_scale is None or loss_scale <= 0):
+        raise ValueError("Median-relative validation requires a positive training-only loss scale")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    head = XASSpectralHead()
+    head = XASSpectralHead(dropout=dropout)
     if source is not None:
         head.load_state_dict(source, strict=True)
     head.to(device)
-    opt = torch.optim.Adam(
-        head.parameters(),
-        lr=lr,
-        fused=device.type == "cuda",
-    )
-    best = float("inf")
-    stale = 0
-    best_epoch = -1
+    opt = torch.optim.Adam(head.parameters(), lr=lr, fused=device.type == "cuda")
+    best, stale, best_epoch = float("inf"), 0, -1
     if schedule == "plateau":
         sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=16, min_lr=1e-6)
     elif schedule == "cosine":
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=500, eta_min=1e-6)
     else:
         raise ValueError(f"Unknown head schedule: {schedule}")
-    if es_metric not in ("mean", "median"):
+    if es_metric not in ("mean", "median", "macro_relative_median", "median_relative"):
         raise ValueError(f"Unknown es_metric: {es_metric}")
     train_X_tensor = torch.as_tensor(X, device=device)
     train_y_tensor = torch.as_tensor(y, device=device)
     val_X_tensor = torch.as_tensor(val_X, device=device)
     val_y_tensor = torch.as_tensor(val_y, device=device)
+    train_task_tensor = None if train_task is None else torch.as_tensor(train_task, dtype=torch.long, device=device)
+    val_task_tensor = None if val_task is None else torch.as_tensor(val_task, dtype=torch.long, device=device)
+    task_base_tensor = None if task_train_base is None else torch.as_tensor(task_train_base, dtype=torch.float32, device=device)
     progress = tqdm(range(epochs), desc=label, unit="epoch")
     stopped_epoch = None
     for epoch in progress:
@@ -308,27 +351,57 @@ def train_head(out: Path, X: np.ndarray, y: np.ndarray, val_X: np.ndarray, val_y
         indices = torch.randperm(len(train_X_tensor), device=device)
         for index in indices.split(args.batch_size):
             opt.zero_grad(set_to_none=True)
-            loss = (head(train_X_tensor[index]) - train_y_tensor[index]).square().mean()
+            prediction = head(train_X_tensor[index])
+            row_mse = (prediction - train_y_tensor[index]).square().mean(1)
+            if loss_balance_power != 0:
+                batch_tasks = train_task_tensor[index]
+                task_losses = []
+                for task_id in torch.unique(batch_tasks):
+                    mask = batch_tasks == task_id
+                    task_losses.append(
+                        row_mse[mask].mean() / task_base_tensor[task_id].clamp_min(1e-12).pow(loss_balance_power)
+                    )
+                loss = torch.stack(task_losses).mean()
+            else:
+                loss = row_mse.mean()
+            if loss_scale is not None:
+                loss = loss / loss_scale
             loss.backward()
             opt.step()
         head.eval()
         with torch.inference_mode():
             val_mse = (head(val_X_tensor) - val_y_tensor).square().mean(1)
-            val = float(val_mse.mean())
-            val_metric = float(val_mse.median()) if es_metric == "median" else val
+            val_mean = float(val_mse.mean())
+            if es_metric == "mean":
+                val_metric = val_mean
+            elif es_metric == "median":
+                val_metric = float(val_mse.median())
+            elif es_metric == "median_relative":
+                val_metric = float(val_mse.median()) / float(loss_scale)
+            else:
+                task_metrics = []
+                for task_id in range(len(FEFF_TASKS)):
+                    mask = val_task_tensor == task_id
+                    if not mask.any():
+                        raise RuntimeError(f"Validation lacks FEFF task {FEFF_TASKS[task_id]}")
+                    task_metrics.append(val_mse[mask].median() / task_base_tensor[task_id].clamp_min(1e-12))
+                val_metric = float(torch.stack(task_metrics).mean())
         if val_metric < best:
             best, stale, best_epoch = val_metric, 0, epoch
-            torch.save({"state_dict": head.state_dict(), "epoch": epoch, "val_loss": val}, checkpoint)
+            torch.save({
+                "state_dict": head.state_dict(), "epoch": epoch, "val_loss": val_mean,
+                "val_metric": val_metric, "dropout": dropout, "learning_rate": lr,
+                "weight_decay": 0.0, "loss_balance_power": loss_balance_power,
+                "es_metric": es_metric, "seed": seed,
+            }, checkpoint)
         else:
             stale += 1
         if schedule == "plateau":
-            sched.step(val)
+            sched.step(val_metric)
         else:
             sched.step()
         progress.set_postfix(
-            val=f"{val_metric:.2e}",
-            best=f"{best:.2e}",
-            lr=f"{opt.param_groups[0]['lr']:.2e}",
+            val=f"{val_metric:.2e}", best=f"{best:.2e}", lr=f"{opt.param_groups[0]['lr']:.2e}"
         )
         if stale >= args.head_patience:
             stopped_epoch = epoch + 1
@@ -350,7 +423,7 @@ def load_state(path: Path) -> dict:
 
 def write_evaluations(run: Path, features: Path, args: argparse.Namespace) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    universal_head = XASSpectralHead().to(device)
+    universal_head = XASSpectralHead(dropout=args.head_dropout).to(device)
     universal_checkpoint = run / "heads/universalXAS/best.pt"
     universal_head.load_state_dict(load_state(universal_checkpoint), strict=True)
     universal_head.eval()
@@ -364,7 +437,7 @@ def write_evaluations(run: Path, features: Path, args: argparse.Namespace) -> No
         universal_test.append({"dataset": task, "variant": "UniversalXAS", **{f"test_{k}": v for k, v in test.items()}})
 
         checkpoint = run / f"heads/tunedUniversalXAS/{task}/best.pt"
-        tuned_head = XASSpectralHead().to(device)
+        tuned_head = XASSpectralHead(dropout=args.head_dropout).to(device)
         tuned_head.load_state_dict(load_state(checkpoint), strict=True)
         tuned_head.eval()
         tuned_validation.append({"dataset": task, "checkpoint": str(checkpoint), **evaluate_head(tuned_head, split.val.X, split.val.y, split.train.y, args.batch_size)})
@@ -493,7 +566,7 @@ def main() -> None:
                 "The interrupted run did not save a resumable encoder checkpoint; "
                 "start a fresh run with a new --run-name or use --overwrite."
             )
-        model = M3GNetXAS(); collate = CollateGraphs(model.encoder, prebuilt=graph_cache is not None); train_ds = make_graph_dataset(FEFF_TASKS, "train", model.encoder)
+        model = M3GNetXAS(head_dropout=args.head_dropout); collate = CollateGraphs(model.encoder, prebuilt=graph_cache is not None); train_ds = make_graph_dataset(FEFF_TASKS, "train", model.encoder)
         task_counts = {task: sum(row[0] == task for row in train_ds.rows) for task in FEFF_TASKS}
         rows_per_element = min(args.encoder_rows_per_element, min(task_counts.values()))
         sampler = BalancedTaskBatchSampler(train_ds.rows, rows_per_element, args.seed)
@@ -518,7 +591,7 @@ def main() -> None:
     expected = [(task, split) for task in FEFF_TASKS for split in SPLITS]
     if missing and len(missing) != len(expected):
         raise RuntimeError("Feature directory is incomplete. Remove it only with --overwrite, then regenerate all features.")
-    model = M3GNetXAS(); state = torch.load(encoder_path, map_location="cpu", weights_only=False)["state_dict"]; model.load_state_dict({k.removeprefix("model."): v for k, v in state.items() if k.startswith("model.")}, strict=True); model.eval(); device = torch.device("cuda" if torch.cuda.is_available() else "cpu"); model.to(device); collate = CollateGraphs(model.encoder, prebuilt=graph_cache is not None)
+    model = M3GNetXAS(head_dropout=args.head_dropout); state = torch.load(encoder_path, map_location="cpu", weights_only=False)["state_dict"]; model.load_state_dict({k.removeprefix("model."): v for k, v in state.items() if k.startswith("model.")}, strict=True); model.eval(); device = torch.device("cuda" if torch.cuda.is_available() else "cpu"); model.to(device); collate = CollateGraphs(model.encoder, prebuilt=graph_cache is not None)
     with torch.inference_mode():
         for task, split in tqdm(missing, desc="M3GNet feature export", unit="split", disable=not missing):
             loader = DataLoader(
@@ -533,12 +606,29 @@ def main() -> None:
                 ys.append(b["y"].numpy())
             X, y = np.concatenate(xs), np.concatenate(ys); np.savetxt(features / f"{task}_{split}_X.txt", X); np.savetxt(features / f"{task}_{split}_y.txt", y)
     validate_features(features, dataset)
-    ux, uy, uvx, uvy = balanced_universal(features, args.seed)
-    universal = train_head(run / "heads/universalXAS", ux, uy, uvx, uvy, None, args, lr=5e-4, epochs=args.head_epochs, schedule="plateau", es_metric="mean", label="UniversalXAS")
+    universal_seed = args.seed if args.universal_seed is None else args.universal_seed
+    tuned_seed = args.seed if args.tuned_seed is None else args.tuned_seed
+    ux, uy, universal_train_task, uvx, uvy, universal_val_task = balanced_universal(features, universal_seed)
+    universal = train_head(
+        run / "heads/universalXAS", ux, uy, uvx, uvy, None, args,
+        lr=args.universal_lr, epochs=args.head_epochs, schedule="plateau",
+        es_metric=args.universal_es_metric, label="UniversalXAS",
+        dropout=args.head_dropout, loss_balance_power=args.universal_loss_balance_power,
+        train_task=universal_train_task, val_task=universal_val_task,
+        task_train_base=train_base.numpy(), seed=universal_seed,
+    )
     universal_state = load_state(universal)
     for i, task in enumerate(FEFF_TASKS):
         split = load_feature_split(features, task)
-        train_head(run / f"heads/tunedUniversalXAS/{task}", split.train.X, split.train.y, split.val.X, split.val.y, universal_state, args, lr=3e-4, epochs=args.tuned_epochs, schedule="cosine", es_metric="median", label=f"Tuned {task} ({i + 1}/{len(FEFF_TASKS)})")
+        train_head(
+            run / f"heads/tunedUniversalXAS/{task}", split.train.X, split.train.y,
+            split.val.X, split.val.y, universal_state, args,
+            lr=args.tuned_lr, epochs=args.tuned_epochs, schedule=args.tuned_schedule,
+            es_metric="median_relative" if args.tuned_loss_normalize else "median",
+            label=f"Tuned {task} ({i + 1}/{len(FEFF_TASKS)})",
+            dropout=args.head_dropout,
+            loss_scale=float(train_base[i]) if args.tuned_loss_normalize else None, seed=tuned_seed,
+        )
     print("Evaluating heads on val and test splits...", flush=True)
     write_evaluations(run, features, args)
     (run / "RUN_COMPLETE.json").write_text(json.dumps({"status": "complete", "selection": "validation metrics only, test evaluated once", "encoder": str(encoder_path), "universal": str(universal)}, indent=2), encoding="utf-8")
