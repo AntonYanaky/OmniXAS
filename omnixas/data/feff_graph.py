@@ -29,7 +29,7 @@ from omnixas.data.ml_data import MLData, MLSplits
 FEFF_TASKS = ["Ti_FEFF", "V_FEFF", "Cr_FEFF", "Mn_FEFF", "Fe_FEFF", "Co_FEFF", "Ni_FEFF", "Cu_FEFF"]
 SPLITS = ("train", "val", "test")
 ENCODER_BATCH = 24
-GRAPH_CACHE_MAX = 1024
+GRAPH_CACHE_MAX = 31_147  # May use too much RAM.
 
 
 def load_id_rows(root: Path, task: str, split: str, dataset_root: Path | None = None) -> list[tuple[str, int]]:
